@@ -15,11 +15,11 @@
 // Kill switch via RiskManager::is_halted() (atomic<bool>).
 //
 // Build:
-//   g++ -std=c++20 -O3 -march=native -Wall -Wextra \
-//       -DBOT_USE_OPENSSL \
-//       -Iinclude \
-//       src/main.cpp \
-//       -lssl -lcrypto -lpthread \
+//   g++ -std=c++20 -O3 -march=native -Wall -Wextra
+//       -DBOT_USE_OPENSSL
+//       -Iinclude
+//       src/main.cpp
+//       -lssl -lcrypto -lpthread
 //       -o cryptobot
 //
 // Run:
@@ -53,6 +53,7 @@
 #include <vector>
 #include <sstream>
 #include <fstream>
+#include <fcntl.h>
 // POSIX HTTP server for GUI
 #include <netdb.h>
 #include <sys/socket.h>
@@ -71,6 +72,109 @@ static std::atomic<bool> g_shutdown{false};
 
 extern "C" void handle_signal(int /*sig*/) {
     g_shutdown.store(true, std::memory_order_release);
+}
+
+static bool shutdown_requested() noexcept {
+    return g_shutdown.load(std::memory_order_acquire);
+}
+
+template<typename Rep, typename Period>
+static bool sleep_or_shutdown(
+    std::chrono::duration<Rep, Period> duration,
+    std::chrono::milliseconds quantum = std::chrono::milliseconds(100)) noexcept
+{
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::duration_cast<std::chrono::steady_clock::duration>(duration);
+
+    while (!shutdown_requested()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return false;
+
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        std::this_thread::sleep_for(std::min(remaining, quantum));
+    }
+
+    return true;
+}
+
+static void set_socket_timeout(int fd, std::chrono::milliseconds timeout) noexcept {
+    struct timeval tv{};
+    tv.tv_sec = static_cast<decltype(tv.tv_sec)>(timeout.count() / 1000);
+    tv.tv_usec = static_cast<decltype(tv.tv_usec)>((timeout.count() % 1000) * 1000);
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static bool wait_fd_ready(
+    int fd,
+    bool want_write,
+    std::chrono::milliseconds timeout) noexcept
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    while (!shutdown_requested()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return false;
+
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        const auto slice = std::min(remaining, std::chrono::milliseconds(200));
+
+        fd_set readfds;
+        fd_set writefds;
+        FD_ZERO(&readfds);
+        FD_ZERO(&writefds);
+        FD_SET(fd, want_write ? &writefds : &readfds);
+
+        struct timeval tv{};
+        tv.tv_sec = static_cast<decltype(tv.tv_sec)>(slice.count() / 1000);
+        tv.tv_usec = static_cast<decltype(tv.tv_usec)>((slice.count() % 1000) * 1000);
+
+        const int ready = ::select(
+            fd + 1,
+            want_write ? nullptr : &readfds,
+            want_write ? &writefds : nullptr,
+            nullptr,
+            &tv);
+        if (ready > 0) return true;
+        if (ready == 0) continue;
+        if (errno == EINTR) continue;
+        return false;
+    }
+
+    return false;
+}
+
+static bool connect_with_timeout(
+    int fd,
+    const struct sockaddr* addr,
+    socklen_t addrlen,
+    std::chrono::milliseconds timeout) noexcept
+{
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return false;
+    if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) return false;
+
+    int rc = ::connect(fd, addr, addrlen);
+    bool connected = (rc == 0);
+
+    if (!connected) {
+        if (errno != EINPROGRESS) {
+            ::fcntl(fd, F_SETFL, flags);
+            return false;
+        }
+
+        connected = wait_fd_ready(fd, true, timeout);
+        if (connected) {
+            int so_error = 0;
+            socklen_t so_error_len = sizeof(so_error);
+            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) != 0 || so_error != 0) {
+                connected = false;
+            }
+        }
+    }
+
+    ::fcntl(fd, F_SETFL, flags);
+    return connected;
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +258,7 @@ public:
             if ((loop % 2u) == 0u) refresh_books();
             if ((loop % 5u) == 0u) poll_closed_candles();
             ++loop;
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (sleep_or_shutdown(std::chrono::seconds(1))) break;
         }
 
         printf("[FEED] Feed thread exiting\n");
@@ -231,7 +335,7 @@ private:
 
     std::string https_get(const std::string& path_query, int* status_out = nullptr) {
         if (status_out) *status_out = 0;
-        if (!ssl_ctx_ || !rest_base_.valid) return {};
+        if (!ssl_ctx_ || !rest_base_.valid || shutdown_requested()) return {};
 
         struct addrinfo hints{}, *res = nullptr;
         hints.ai_family = AF_UNSPEC;
@@ -248,7 +352,9 @@ private:
 
             const int yes = 1;
             ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-            if (::connect(fd, it->ai_addr, it->ai_addrlen) != 0) {
+            set_socket_timeout(fd, std::chrono::milliseconds(1000));
+            if (!connect_with_timeout(fd, it->ai_addr, static_cast<socklen_t>(it->ai_addrlen),
+                                      std::chrono::milliseconds(1500))) {
                 ::close(fd);
                 fd = -1;
                 continue;
@@ -286,6 +392,11 @@ private:
 
         std::size_t written = 0;
         while (written < request.size()) {
+            if (shutdown_requested()) {
+                SSL_free(ssl);
+                ::close(fd);
+                return {};
+            }
             const int n = SSL_write(
                 ssl,
                 request.data() + written,
@@ -301,6 +412,10 @@ private:
         std::string response;
         char buf[4096];
         for (;;) {
+            if (shutdown_requested()) {
+                response.clear();
+                break;
+            }
             const int n = SSL_read(ssl, buf, sizeof(buf));
             if (n > 0) {
                 response.append(buf, static_cast<std::size_t>(n));
@@ -596,7 +711,7 @@ public:
             FD_ZERO(&readfds);
             FD_SET(srv, &readfds);
             struct timeval tv{};
-            tv.tv_sec = 1;
+            tv.tv_usec = 200000;
 
             const int ready = ::select(srv + 1, &readfds, nullptr, nullptr, &tv);
             if (ready <= 0) continue;
@@ -846,7 +961,7 @@ int main(int argc, char* argv[]) {
     std::thread metrics_thread([&] {
         int tick = 0;
         while (!g_shutdown.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::seconds(10));
+            if (sleep_or_shutdown(std::chrono::seconds(10))) break;
             ++tick;
             const bot::PortfolioSnapshot snap = portfolio.load();
             printf("\n[HB %03d] equity=$%.2f | open=%d | pnl=$%.2f | DD=%.2f%%\n",
@@ -861,6 +976,7 @@ int main(int argc, char* argv[]) {
                    gateway.virtual_balance());
             fflush(stdout);
         }
+        printf("[METRICS] Metrics thread exiting\n");
     });
 
     printf("[MAIN] Running in SHADOW mode. Press Ctrl+C to stop.\n\n");
