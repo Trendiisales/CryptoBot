@@ -58,6 +58,19 @@ constexpr const char* signal_type_str(SignalType t) noexcept {
     }
 }
 
+constexpr const char* ord_status_str(OrdStatus s) noexcept {
+    switch (s) {
+        case OrdStatus::PENDING:           return "pending";
+        case OrdStatus::OPEN:              return "open";
+        case OrdStatus::PARTIALLY_FILLED:  return "partially_filled";
+        case OrdStatus::FILLED:            return "filled";
+        case OrdStatus::CANCELLED:         return "cancelled";
+        case OrdStatus::REJECTED:          return "rejected";
+        case OrdStatus::EXPIRED:           return "expired";
+        default:                           return "unknown";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BookLevel — single price level in the order book
 // ---------------------------------------------------------------------------
@@ -227,13 +240,23 @@ struct alignas(CACHE_LINE_SIZE) Trade {
 
     std::int64_t opened_ns{0};
     std::int64_t closed_ns{0};
+    std::int64_t opened_epoch_ms{0};
+    std::int64_t closed_epoch_ms{0};
+    std::int64_t entry_latency_us{0};
+    std::int64_t exit_latency_us{0};
+    OrdStatus    entry_order_status{OrdStatus::PENDING};
+    OrdStatus    exit_order_status{OrdStatus::PENDING};
 
     Signal       signal{};   // copy of originating signal
 
-    [[nodiscard]] double pnl_usd() const noexcept {
+    [[nodiscard]] double gross_pnl_usd() const noexcept {
         if (entry_price <= 0.0 || qty <= 0.0) return 0.0;
         const double sign = (side == Side::BUY) ? 1.0 : -1.0;
-        return sign * (exit_price - entry_price) * qty - entry_fee - exit_fee;
+        return sign * (exit_price - entry_price) * qty;
+    }
+
+    [[nodiscard]] double pnl_usd() const noexcept {
+        return gross_pnl_usd() - entry_fee - exit_fee;
     }
 
     [[nodiscard]] double pnl_bps() const noexcept {

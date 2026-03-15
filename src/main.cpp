@@ -934,10 +934,14 @@ int main(int argc, char* argv[]) {
     MarketDataFeed::CandleQueue candle_queue;
 
     bot::ShadowGateway gateway(cfg.shadow, cfg.fee, state);
+    bot::TradeJournal trade_journal(cfg.trade_log_file);
     bot::TradeEngine<bot::ShadowGateway> engine(
-        state, gateway, composer, fee_gate, risk_mgr, portfolio, cfg);
+        state, gateway, composer, fee_gate, risk_mgr, portfolio, trade_journal, cfg);
 
     printf("[INIT] Shadow balance: $%.2f\n", gateway.virtual_balance());
+    printf("[INIT] Trade journal : %s%s\n",
+           cfg.trade_log_file.c_str(),
+           trade_journal.enabled() ? "" : " (unavailable)");
 
     std::signal(SIGINT,  handle_signal);
     std::signal(SIGTERM, handle_signal);

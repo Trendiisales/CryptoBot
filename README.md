@@ -31,6 +31,7 @@ Edit `config/config.ini`:
 - `shadow_mode = false`  → blocked in this build
 - Fill in `api_key` and `api_secret` under `[exchange]`
 - Tune `[fees]`, `[risk]`, `[strategy]` sections
+- `trade_log_file = logs/trades.csv` stores every closed trade persistently for evaluation
 - `allow_short_entries = false` keeps spot trading long-only; SELL signals flatten longs
 
 ## Architecture
@@ -100,3 +101,13 @@ wss://fstream.binance.com/<symbol>@markPrice@1s  — funding rate
 
 Educational purposes. Crypto trading carries substantial risk.
 Always run in shadow mode first. Never trade money you cannot afford to lose.
+
+## Trade Journal
+
+Each closed trade is appended to `trade_log_file` as CSV and flushed
+immediately. The journal includes:
+- symbol, side, signal type, confidence, expected edge
+- entry and exit UTC timestamps, hold time, prices, quantity, notional
+- order status and simulated latency for entry and exit
+- gross P&L, fees, net P&L, P&L in bps, exit reason
+- portfolio equity, available cash, cumulative P&L after the trade

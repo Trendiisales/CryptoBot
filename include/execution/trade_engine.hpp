@@ -23,6 +23,7 @@
 #include "strategies/strategies.hpp"
 #include "risk/risk_manager.hpp"
 #include "execution/gateway.hpp"
+#include "execution/trade_journal.hpp"
 
 #include <array>
 #include <atomic>
@@ -91,6 +92,7 @@ public:
         FeeGate&        fee_gate,
         RiskManager&    risk,
         AtomicPortfolio& portfolio,
+        TradeJournal&    trade_journal,
         const Settings& cfg)
         : state_(state)
         , gateway_(gateway)
@@ -98,6 +100,7 @@ public:
         , fee_gate_(fee_gate)
         , risk_(risk)
         , portfolio_(portfolio)
+        , trade_journal_(trade_journal)
         , cfg_(cfg)
     {
         // TradeSlot contains atomic — init via placement new default construction
@@ -226,6 +229,7 @@ private:
     FeeGate&         fee_gate_;
     RiskManager&     risk_;
     AtomicPortfolio& portfolio_;
+    TradeJournal&    trade_journal_;
     const Settings&  cfg_;
 
     // Signal SPSC queue — feed threads produce, exec thread consumes
@@ -331,6 +335,12 @@ private:
         t.qty            = pr.result.filled_qty;
         t.entry_fee      = pr.result.fee_paid;
         t.opened_ns      = now_ns();
+        t.opened_epoch_ms = epoch_ms();
+        t.entry_latency_us = pr.result.latency_us;
+        t.entry_order_status = pr.result.status;
+        t.closed_epoch_ms = 0;
+        t.exit_latency_us = 0;
+        t.exit_order_status = OrdStatus::PENDING;
         t.signal         = sig;
 
         const auto [stop, tp] = risk_.compute_stops(t.entry_price, t.side);
@@ -381,6 +391,9 @@ private:
         t.exit_price  = actual_exit;
         t.exit_fee    = pr.ok ? pr.result.fee_paid : 0.0;
         t.closed_ns   = now_ns();
+        t.closed_epoch_ms = epoch_ms();
+        t.exit_latency_us = pr.ok ? pr.result.latency_us : 0;
+        t.exit_order_status = pr.ok ? pr.result.status : OrdStatus::REJECTED;
         t.state       = TradeState::CLOSED;
 
         // Update stats
@@ -405,6 +418,7 @@ private:
         portfolio_.store(np);
 
         append_closed_trade(t, reason);
+        trade_journal_.record_closed_trade(t, np, reason, gateway_.is_shadow());
 
         // Clear slot
         SymbolState* ss = state_.get(t.symbol.view());
@@ -443,7 +457,7 @@ private:
         rec.pnl_bps         = trade.pnl_bps();
         rec.entry_price     = trade.entry_price;
         rec.exit_price      = trade.exit_price;
-        rec.closed_epoch_ms = epoch_ms();
+        rec.closed_epoch_ms = trade.closed_epoch_ms > 0 ? trade.closed_epoch_ms : epoch_ms();
         rec.hold_ms         = static_cast<std::int64_t>((trade.closed_ns - trade.opened_ns) / 1'000'000);
 
         const char* log_reason =

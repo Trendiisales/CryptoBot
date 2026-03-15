@@ -320,6 +320,7 @@ struct Settings {
     std::string      ws_spot;
     std::string      ws_perp;
     std::string      log_level;
+    std::string      trade_log_file;
     int              metrics_port{9090};
 
     static Settings from_config(const Config& c) {
@@ -338,6 +339,7 @@ struct Settings {
         s.ws_spot        = c.ws_spot();
         s.ws_perp        = c.ws_perp();
         s.log_level      = c.get("bot", "log_level", "INFO");
+        s.trade_log_file = c.get("bot", "trade_log_file", "logs/trades.csv");
         s.metrics_port   = c.get_int("bot", "metrics_port", 9090);
         return s;
     }
