@@ -167,6 +167,7 @@ function reasonClass(r) {
   const rl = r.toLowerCase();
   if (rl === 'tp') return 'tp';
   if (rl === 'sl' || rl === 'sc' || rl === 'stop_hit') return 'sl';
+  if (rl === 'sig' || rl === 'signal' || rl === 'signal_exit') return 'trail';
   if (rl.startsWith('trail')) return 'trail';
   return 'timeout';
 }
@@ -175,6 +176,7 @@ function normalizeReason(r) {
   if (!r) return 'TO';
   const ru = r.toUpperCase();
   if (ru === 'SC' || ru === 'STOP_HIT') return 'SL';
+  if (ru === 'SIGNAL' || ru === 'SIGNAL_EXIT') return 'SIG';
   if (ru.startsWith('TRAIL')) return 'TRAIL';
   if (ru === 'TIMEOUT') return 'TO';
   return ru;

@@ -38,9 +38,13 @@
 #include "execution/trade_engine.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <thread>
 #include <chrono>
+#include <cctype>
+#include <cerrno>
 #include <csignal>
+#include <ctime>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -50,10 +54,15 @@
 #include <sstream>
 #include <fstream>
 // POSIX HTTP server for GUI
+#include <netdb.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <netinet/tcp.h>
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 // ---------------------------------------------------------------------------
 // Global shutdown flag — set by SIGINT/SIGTERM
@@ -68,21 +77,6 @@ extern "C" void handle_signal(int /*sig*/) {
 // Minimal JSON field extractor (no heap, no external lib)
 // ---------------------------------------------------------------------------
 namespace parse {
-
-// Extract the value of a JSON string field "key":"<VALUE>"
-// Returns pointer to start of value and writes len
-static const char* str_field(const char* json, const char* key,
-                               std::size_t* len) noexcept {
-    char needle[64];
-    std::snprintf(needle, sizeof(needle), "\"%s\":\"", key);
-    const char* pos = std::strstr(json, needle);
-    if (!pos) { *len = 0; return nullptr; }
-    const char* start = pos + std::strlen(needle);
-    const char* end   = std::strchr(start, '"');
-    if (!end)   { *len = 0; return nullptr; }
-    *len = static_cast<std::size_t>(end - start);
-    return start;
-}
 
 static double dbl_field(const char* json, const char* key) noexcept {
     char needle[64];
@@ -110,96 +104,410 @@ struct alignas(bot::CACHE_LINE_SIZE) CandleCloseEvent {
 };
 
 // ---------------------------------------------------------------------------
-// Stub WebSocket feed (uses std::this_thread::sleep as placeholder)
-// In production: replace with real WebSocket client (e.g. libwebsockets,
-// uWebSockets, or a custom epoll+SSL loop).
+// REST polling market-data feed for shadow mode.
+// Uses Binance HTTPS public endpoints to populate ticker, depth, and closed
+// candles without requiring a full WebSocket stack.
 // ---------------------------------------------------------------------------
-class WebSocketFeed {
+class MarketDataFeed {
 public:
     using CandleQueue = bot::SpscRingBuffer<CandleCloseEvent, 1024>;
 
-    WebSocketFeed(
-        bot::MarketState&   state,
-        CandleQueue&        candle_queue,
+    MarketDataFeed(
+        bot::MarketState&    state,
+        CandleQueue&         candle_queue,
         const bot::Settings& cfg)
         : state_(state)
         , candle_queue_(candle_queue)
         , cfg_(cfg)
-    {}
-
-    // Feed thread entry point
-    void run() noexcept {
-        printf("[FEED] Starting market data feed (%s mode)\n",
-               cfg_.is_shadow_mode ? "SHADOW" : "LIVE");
-        printf("[FEED] WS endpoint: %s\n", cfg_.ws_spot.c_str());
-        printf("[FEED] NOTE: Replace this stub with a real WebSocket client\n");
-        printf("[FEED]       e.g. uWebSockets, libwebsockets, or Boost.Beast\n");
-
-        // --- Stub: simulate candle closes at 1-minute intervals ---
-        // In production this loop would be replaced by the WS receive loop
-        // which calls on_message() for each incoming JSON frame.
-        std::int64_t tick = 0;
-        while (!g_shutdown.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-
-            // Simulate a candle close for each registered symbol
-            for (std::size_t i = 0; i < state_.n_symbols(); ++i) {
-                bot::SymbolState* ss = state_.get(static_cast<int>(i));
-                if (!ss) continue;
-
-                // Simulate ticker update
-                const double fake_price = 50000.0 + static_cast<double>(tick % 200);
-                bot::Ticker t{};
-                t.symbol    = ss->symbol;
-                t.bid       = fake_price - 0.5;
-                t.ask       = fake_price + 0.5;
-                t.last      = fake_price;
-                t.volume_24h = 1000.0;
-                t.ts_ns     = bot::now_ns();
-                ss->ticker.store(t);
-
-                // Simulate order book
-                bot::OrderBook book{};
-                book.symbol = ss->symbol;
-                book.ts_ns  = bot::now_ns();
-                book.n_bids = 5;
-                book.n_asks = 5;
-                for (int j = 0; j < 5; ++j) {
-                    book.bids[j] = {fake_price - (j + 1) * 0.5, 1.0 + j * 0.5};
-                    book.asks[j] = {fake_price + (j + 1) * 0.5, 1.0 + j * 0.5};
-                }
-                ss->book.store(book);
-
-                // Simulate closed candle every 60 ticks
-                if (tick > 0 && tick % 60 == 0) {
-                    bot::Candle c{};
-                    c.symbol       = ss->symbol;
-                    c.open         = fake_price - 5;
-                    c.high         = fake_price + 10;
-                    c.low          = fake_price - 10;
-                    c.close        = fake_price;
-                    c.volume       = 100.0 + (tick % 50);
-                    c.open_time_ms = bot::epoch_ms() - 60000;
-                    c.close_time_ms= bot::epoch_ms();
-                    c.is_closed    = true;
-                    ss->candles.push(c);
-
-                    CandleCloseEvent ev{};
-                    ev.symbol  = ss->symbol;
-                    ev.sym_idx = static_cast<int>(i);
-                    ev.candle  = c;
-                    candle_queue_.push(ev);
-                }
-            }
-            ++tick;
+        , rest_base_(split_rest_base(cfg.rest_base))
+    {
+        OPENSSL_init_ssl(0, nullptr);
+        ssl_ctx_ = SSL_CTX_new(TLS_client_method());
+        if (ssl_ctx_) {
+            SSL_CTX_set_default_verify_paths(ssl_ctx_);
         }
+    }
+
+    ~MarketDataFeed() {
+        if (ssl_ctx_) {
+            SSL_CTX_free(ssl_ctx_);
+        }
+    }
+
+    void run() noexcept {
+        printf("[FEED] Starting REST market data feed (SHADOW mode)\n");
+        printf("[FEED] REST endpoint: %s\n", cfg_.rest_base.c_str());
+
+        if (!ssl_ctx_ || !rest_base_.valid) {
+            fprintf(stderr, "[FEED] HTTPS initialisation failed\n");
+            g_shutdown.store(true, std::memory_order_release);
+            return;
+        }
+
+        bootstrap_candles();
+        refresh_tickers();
+        refresh_books();
+
+        std::uint64_t loop = 0;
+        while (!g_shutdown.load(std::memory_order_acquire)) {
+            refresh_tickers();
+            if ((loop % 2u) == 0u) refresh_books();
+            if ((loop % 5u) == 0u) poll_closed_candles();
+            ++loop;
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+
         printf("[FEED] Feed thread exiting\n");
     }
 
 private:
+    struct RestBase {
+        std::string host;
+        std::string prefix;
+        bool valid{false};
+    };
+
     bot::MarketState&    state_;
     CandleQueue&         candle_queue_;
     const bot::Settings& cfg_;
+    RestBase             rest_base_{};
+    SSL_CTX*             ssl_ctx_{nullptr};
+    std::array<std::int64_t, bot::MarketState::MAX_SYMBOLS> last_closed_candle_ms_{};
+
+    static RestBase split_rest_base(const std::string& url) {
+        RestBase base;
+        const auto scheme_pos = url.find("://");
+        if (scheme_pos == std::string::npos) return base;
+
+        const std::size_t host_start = scheme_pos + 3;
+        const auto slash_pos = url.find('/', host_start);
+        base.host = url.substr(host_start, slash_pos == std::string::npos
+            ? std::string::npos
+            : slash_pos - host_start);
+        base.prefix = slash_pos == std::string::npos ? "" : url.substr(slash_pos);
+        base.valid = !base.host.empty();
+        return base;
+    }
+
+    static void skip_ws(const char*& p) noexcept {
+        while (*p && std::isspace(static_cast<unsigned char>(*p))) ++p;
+    }
+
+    static bool consume_char(const char*& p, char expected) noexcept {
+        skip_ws(p);
+        if (*p != expected) return false;
+        ++p;
+        return true;
+    }
+
+    static bool parse_int64_token(const char*& p, std::int64_t& out) noexcept {
+        skip_ws(p);
+        errno = 0;
+        char* end = nullptr;
+        const long long value = std::strtoll(p, &end, 10);
+        if (end == p || errno == ERANGE) return false;
+        out = static_cast<std::int64_t>(value);
+        p = end;
+        return true;
+    }
+
+    static bool parse_quoted_double_token(const char*& p, double& out) noexcept {
+        skip_ws(p);
+        if (*p != '"') return false;
+        ++p;
+        errno = 0;
+        char* end = nullptr;
+        const double value = std::strtod(p, &end);
+        if (end == p || *end != '"' || errno == ERANGE) return false;
+        out = value;
+        p = end + 1;
+        return true;
+    }
+
+    static void skip_to_item_end(const char*& p) noexcept {
+        while (*p && *p != ']') ++p;
+        if (*p == ']') ++p;
+    }
+
+    std::string https_get(const std::string& path_query, int* status_out = nullptr) {
+        if (status_out) *status_out = 0;
+        if (!ssl_ctx_ || !rest_base_.valid) return {};
+
+        struct addrinfo hints{}, *res = nullptr;
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        if (::getaddrinfo(rest_base_.host.c_str(), "443", &hints, &res) != 0) {
+            return {};
+        }
+
+        int fd = -1;
+        SSL* ssl = nullptr;
+        for (struct addrinfo* it = res; it != nullptr; it = it->ai_next) {
+            fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+            if (fd < 0) continue;
+
+            const int yes = 1;
+            ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+            if (::connect(fd, it->ai_addr, it->ai_addrlen) != 0) {
+                ::close(fd);
+                fd = -1;
+                continue;
+            }
+
+            ssl = SSL_new(ssl_ctx_);
+            if (!ssl) {
+                ::close(fd);
+                fd = -1;
+                continue;
+            }
+
+            SSL_set_tlsext_host_name(ssl, rest_base_.host.c_str());
+            SSL_set_fd(ssl, fd);
+            if (SSL_connect(ssl) == 1) break;
+
+            SSL_free(ssl);
+            ssl = nullptr;
+            ::close(fd);
+            fd = -1;
+        }
+        ::freeaddrinfo(res);
+
+        if (fd < 0 || !ssl) {
+            return {};
+        }
+
+        const std::string full_path = rest_base_.prefix + path_query;
+        const std::string request =
+            "GET " + full_path + " HTTP/1.1\r\n"
+            "Host: " + rest_base_.host + "\r\n"
+            "User-Agent: CryptoBot/1.0\r\n"
+            "Accept: application/json\r\n"
+            "Connection: close\r\n\r\n";
+
+        std::size_t written = 0;
+        while (written < request.size()) {
+            const int n = SSL_write(
+                ssl,
+                request.data() + written,
+                static_cast<int>(request.size() - written));
+            if (n <= 0) {
+                SSL_free(ssl);
+                ::close(fd);
+                return {};
+            }
+            written += static_cast<std::size_t>(n);
+        }
+
+        std::string response;
+        char buf[4096];
+        for (;;) {
+            const int n = SSL_read(ssl, buf, sizeof(buf));
+            if (n > 0) {
+                response.append(buf, static_cast<std::size_t>(n));
+                continue;
+            }
+
+            const int err = SSL_get_error(ssl, n);
+            if (err == SSL_ERROR_ZERO_RETURN) break;
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) continue;
+            break;
+        }
+
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        ::close(fd);
+
+        const auto line_end = response.find("\r\n");
+        if (line_end != std::string::npos) {
+            const auto status_start = response.find(' ');
+            if (status_start != std::string::npos && status_start + 4 <= line_end) {
+                if (status_out) {
+                    *status_out = std::atoi(response.substr(status_start + 1, 3).c_str());
+                }
+            }
+        }
+
+        const auto body_start = response.find("\r\n\r\n");
+        return body_start == std::string::npos ? std::string{} : response.substr(body_start + 4);
+    }
+
+    static std::vector<bot::Candle> parse_klines(
+        const std::string& json,
+        const bot::Symbol& symbol)
+    {
+        std::vector<bot::Candle> candles;
+        const char* p = json.c_str();
+        const std::int64_t now_ms = bot::epoch_ms();
+
+        skip_ws(p);
+        if (*p != '[') return candles;
+        ++p;
+
+        while (*p) {
+            skip_ws(p);
+            if (*p == ']') break;
+            if (*p == ',') { ++p; continue; }
+            if (*p != '[') break;
+            ++p;
+
+            bot::Candle c{};
+            c.symbol = symbol;
+            if (!parse_int64_token(p, c.open_time_ms)) break;
+            if (!consume_char(p, ',')) break;
+            if (!parse_quoted_double_token(p, c.open)) break;
+            if (!consume_char(p, ',')) break;
+            if (!parse_quoted_double_token(p, c.high)) break;
+            if (!consume_char(p, ',')) break;
+            if (!parse_quoted_double_token(p, c.low)) break;
+            if (!consume_char(p, ',')) break;
+            if (!parse_quoted_double_token(p, c.close)) break;
+            if (!consume_char(p, ',')) break;
+            if (!parse_quoted_double_token(p, c.volume)) break;
+            if (!consume_char(p, ',')) break;
+            if (!parse_int64_token(p, c.close_time_ms)) break;
+
+            c.is_closed = c.close_time_ms <= now_ms;
+            candles.push_back(c);
+            skip_to_item_end(p);
+        }
+
+        return candles;
+    }
+
+    static std::uint32_t parse_levels(
+        const char* json,
+        const char* key,
+        std::array<bot::BookLevel, bot::OrderBook::MAX_LEVELS>& levels) noexcept
+    {
+        char needle[32];
+        std::snprintf(needle, sizeof(needle), "\"%s\":[", key);
+        const char* p = std::strstr(json, needle);
+        if (!p) return 0;
+        p += std::strlen(needle);
+
+        std::uint32_t count = 0;
+        while (*p && count < levels.size()) {
+            skip_ws(p);
+            if (*p == ']') break;
+            if (*p == ',') { ++p; continue; }
+            if (*p != '[') break;
+            ++p;
+
+            double price = 0.0;
+            double qty = 0.0;
+            if (!parse_quoted_double_token(p, price)) break;
+            if (!consume_char(p, ',')) break;
+            if (!parse_quoted_double_token(p, qty)) break;
+
+            levels[count++] = {price, qty};
+            skip_to_item_end(p);
+        }
+
+        return count;
+    }
+
+    void bootstrap_candles() {
+        const int limit = std::max(30, std::min(cfg_.strategy.candle_history, 256));
+        printf("[FEED] Bootstrapping %d historical candles per symbol\n", limit);
+
+        for (std::size_t i = 0; i < state_.n_symbols(); ++i) {
+            bot::SymbolState* ss = state_.get(static_cast<int>(i));
+            if (!ss) continue;
+
+            int status = 0;
+            const std::string body = https_get(
+                "/v3/klines?symbol=" + std::string(ss->symbol.view())
+                + "&interval=1m&limit=" + std::to_string(limit),
+                &status);
+            if (status != 200 || body.empty()) {
+                fprintf(stderr, "[FEED] Failed to bootstrap candles for %s\n", ss->symbol.data);
+                continue;
+            }
+
+            const auto candles = parse_klines(body, ss->symbol);
+            std::size_t loaded = 0;
+            for (const auto& candle : candles) {
+                if (!candle.is_closed) continue;
+                ss->candles.push(candle);
+                last_closed_candle_ms_[i] = std::max(last_closed_candle_ms_[i], candle.close_time_ms);
+                ++loaded;
+            }
+
+            printf("[FEED] %s historical candles loaded: %zu\n", ss->symbol.data, loaded);
+        }
+    }
+
+    void refresh_tickers() {
+        for (std::size_t i = 0; i < state_.n_symbols(); ++i) {
+            bot::SymbolState* ss = state_.get(static_cast<int>(i));
+            if (!ss) continue;
+
+            int status = 0;
+            const std::string body = https_get(
+                "/v3/ticker/bookTicker?symbol=" + std::string(ss->symbol.view()),
+                &status);
+            if (status != 200 || body.empty()) continue;
+
+            bot::Ticker ticker{};
+            ticker.symbol = ss->symbol;
+            ticker.bid = parse::dbl_field(body.c_str(), "bidPrice");
+            ticker.ask = parse::dbl_field(body.c_str(), "askPrice");
+            ticker.last = (ticker.bid > 0.0 && ticker.ask > 0.0)
+                ? (ticker.bid + ticker.ask) * 0.5
+                : 0.0;
+            ticker.ts_ns = bot::now_ns();
+            ss->ticker.store(ticker);
+        }
+    }
+
+    void refresh_books() {
+        for (std::size_t i = 0; i < state_.n_symbols(); ++i) {
+            bot::SymbolState* ss = state_.get(static_cast<int>(i));
+            if (!ss) continue;
+
+            int status = 0;
+            const std::string body = https_get(
+                "/v3/depth?symbol=" + std::string(ss->symbol.view()) + "&limit=20",
+                &status);
+            if (status != 200 || body.empty()) continue;
+
+            bot::OrderBook book{};
+            book.symbol = ss->symbol;
+            book.ts_ns = bot::now_ns();
+            book.n_bids = parse_levels(body.c_str(), "bids", book.bids);
+            book.n_asks = parse_levels(body.c_str(), "asks", book.asks);
+            if (book.n_bids == 0 || book.n_asks == 0) continue;
+            ss->book.store(book);
+        }
+    }
+
+    void poll_closed_candles() {
+        for (std::size_t i = 0; i < state_.n_symbols(); ++i) {
+            bot::SymbolState* ss = state_.get(static_cast<int>(i));
+            if (!ss) continue;
+
+            int status = 0;
+            const std::string body = https_get(
+                "/v3/klines?symbol=" + std::string(ss->symbol.view()) + "&interval=1m&limit=3",
+                &status);
+            if (status != 200 || body.empty()) continue;
+
+            const auto candles = parse_klines(body, ss->symbol);
+            for (const auto& candle : candles) {
+                if (!candle.is_closed) continue;
+                if (candle.close_time_ms <= last_closed_candle_ms_[i]) continue;
+
+                last_closed_candle_ms_[i] = candle.close_time_ms;
+                ss->candles.push(candle);
+
+                CandleCloseEvent ev{};
+                ev.symbol = ss->symbol;
+                ev.sym_idx = static_cast<int>(i);
+                ev.candle = candle;
+                candle_queue_.push(ev);
+            }
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -225,8 +533,9 @@ public:
         , state_(state)
         , portfolio_(portfolio)
         , is_shadow_(is_shadow)
+        , start_epoch_ms_(bot::epoch_ms())
     {
-        // Capture stats via lambda-compatible pointer
+        // Capture stats via lambda-compatible pointer.
         get_stats_ = [&engine]() -> std::string {
             std::ostringstream ss;
             const auto& st = engine.stats();
@@ -234,8 +543,32 @@ public:
                << '"' << "signals_blocked_fee" << '"' << ':' << st.signals_blocked_fee.load() << ','
                << '"' << "signals_blocked_risk" << '"' << ':' << st.signals_blocked_risk.load() << ','
                << '"' << "trades_entered" << '"' << ':' << st.trades_entered.load() << ','
+               << '"' << "total_trades" << '"' << ':' << engine.total_trade_count() << ','
                << '"' << "open_trades" << '"' << ':' << engine.open_trade_count() << ','
+               << '"' << "fee_gate_pass_rate" << '"' << ':' << engine.fee_gate_pass_rate_ratio() << ','
                << '"' << "gateway_avg_lat_us" << '"' << ':' << engine.gateway_latency_avg_us();
+            return ss.str();
+        };
+
+        get_trade_log_ = [&engine]() -> std::string {
+            std::ostringstream ss;
+            const auto log = engine.closed_trade_log();
+            ss << '[';
+            for (std::size_t i = 0; i < log.count; ++i) {
+                const auto& rec = log.entries[i];
+                if (i > 0) ss << ',';
+                ss << '{'
+                   << '"' << "t" << '"' << ':' << '"' << format_time_hms(rec.closed_epoch_ms) << '"' << ','
+                   << '"' << "s" << '"' << ':' << '"' << rec.symbol.view() << '"' << ','
+                   << '"' << "e" << '"' << ':' << '"' << bot::signal_type_str(rec.signal_type) << '"' << ','
+                   << '"' << "p" << '"' << ':' << rec.pnl_bps << ','
+                   << '"' << "en" << '"' << ':' << rec.entry_price << ','
+                   << '"' << "ex" << '"' << ':' << rec.exit_price << ','
+                   << '"' << "hold" << '"' << ':' << rec.hold_ms << ','
+                   << '"' << "reason" << '"' << ':' << '"' << rec.reason << '"'
+                   << '}';
+            }
+            ss << ']';
             return ss.str();
         };
     }
@@ -259,6 +592,15 @@ public:
         printf("[GUI] Serving on http://0.0.0.0:%d\n", port_);
 
         while (!g_shutdown.load(std::memory_order_acquire)) {
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(srv, &readfds);
+            struct timeval tv{};
+            tv.tv_sec = 1;
+
+            const int ready = ::select(srv + 1, &readfds, nullptr, nullptr, &tv);
+            if (ready <= 0) continue;
+
             struct sockaddr_in client_addr{};
             socklen_t clen = sizeof(client_addr);
             const int fd = ::accept(srv, reinterpret_cast<struct sockaddr*>(&client_addr), &clen);
@@ -273,7 +615,9 @@ private:
     bot::MarketState&      state_;
     bot::AtomicPortfolio&  portfolio_;
     bool                   is_shadow_;
+    std::int64_t           start_epoch_ms_{0};
     std::function<std::string()> get_stats_;
+    std::function<std::string()> get_trade_log_;
 
     void handle_client(int fd) noexcept {
         char req[2048]{};
@@ -308,7 +652,6 @@ private:
 
     std::string build_state_json() const noexcept {
         const bot::PortfolioSnapshot snap = portfolio_.load();
-        const auto start_ns = bot::now_ns();
 
         std::ostringstream j;
         j << '{';
@@ -329,10 +672,11 @@ private:
         j << get_stats_() << ',';
 
         j << '"' << "is_shadow" << '"' << ':' << (is_shadow_ ? "true" : "false") << ',';
-        j << '"' << "total_trades" << '"' << ':' << snap.open_trade_count << ',';
 
         // Uptime
-        j << '"' << "uptime_hours" << '"' << ':' << 0.0 << ',';
+        j << '"' << "uptime_hours" << '"' << ':'
+          << static_cast<double>(bot::epoch_ms() - start_epoch_ms_) / 3'600'000.0
+          << ',';
 
         // Per-symbol data
         j << '"' << "symbols" << '"' << ":{";
@@ -346,6 +690,8 @@ private:
             const bot::Ticker    ticker  = ss->ticker.load();
             const bot::OrderBook book    = ss->book.load();
             const double         pos_usd = ss->get_position_usd();
+            const auto           last_signal_type = static_cast<bot::SignalType>(
+                ss->last_signal_type.load(std::memory_order_acquire));
 
             j << '"' << ss->symbol.view() << '"' << ":{";
             j << '"' << "price" << '"' << ':' << ticker.last << ',';
@@ -353,15 +699,49 @@ private:
             j << '"' << "ask" << '"' << ':' << ticker.ask << ',';
             j << '"' << "spread_bps" << '"' << ':' << ticker.spread_bps() << ',';
             j << '"' << "ofi" << '"' << ':' << book.order_flow_imbalance() << ',';
-            j << '"' << "position_usd" << '"' << ':' << pos_usd;
+            j << '"' << "position_usd" << '"' << ':' << pos_usd << ',';
+            j << '"' << "last_signal_type" << '"' << ':' << '"'
+              << bot::signal_type_str(last_signal_type) << '"' << ',';
+            j << '"' << "engines" << '"' << ":{";
+            append_engine_json(j, "momentum", last_signal_type == bot::SignalType::MOMENTUM);
+            j << ',';
+            append_engine_json(j, "mean_reversion", last_signal_type == bot::SignalType::MEAN_REVERSION);
+            j << ',';
+            append_engine_json(j, "order_flow", last_signal_type == bot::SignalType::ORDER_FLOW);
+            j << ',';
+            append_engine_json(j, "perp_basis", last_signal_type == bot::SignalType::PERP_BASIS);
+            j << ',';
+            append_engine_json(j, "composite", last_signal_type == bot::SignalType::COMPOSITE);
+            j << "}";
             j << "}";
         }
         j << "},";
 
-        // Empty trade log (backend can populate in future)
-        j << '"' << "trade_log" << '"' << ":[]";
+        j << '"' << "trade_log" << '"' << ':' << get_trade_log_();
         j << '}';
         return j.str();
+    }
+
+    static std::string format_time_hms(std::int64_t epoch_ms) {
+        const std::time_t secs = static_cast<std::time_t>(epoch_ms / 1000);
+        std::tm tm{};
+        gmtime_r(&secs, &tm);
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
+                      tm.tm_hour, tm.tm_min, tm.tm_sec);
+        return std::string(buf);
+    }
+
+    static void append_engine_json(
+        std::ostringstream& out,
+        const char* name,
+        bool active)
+    {
+        out << '"' << name << '"' << ":{"
+            << '"' << "active" << '"' << ':' << (active ? "true" : "false") << ','
+            << '"' << "total_pnl_bp" << '"' << ':' << 0.0 << ','
+            << '"' << "trades" << '"' << ':' << 0
+            << '}';
     }
 
     void serve_file(int fd, const char* filepath, const char* mime) noexcept {
@@ -405,6 +785,12 @@ int main(int argc, char* argv[]) {
     printf("[INIT] Max pos USD   : $%.0f\n",    cfg.risk.max_position_usd);
     printf("[INIT] Daily DD halt : %.1f%%\n",   cfg.risk.daily_dd_limit_pct);
 
+    if (!cfg.is_shadow_mode) {
+        fprintf(stderr,
+                "[INIT] Live trading is disabled in this build. Set shadow_mode = true for paper trading.\n");
+        return 2;
+    }
+
     // 2. Build market state
     bot::MarketState state;
     const auto spot_pairs = raw_cfg.get_list("pairs", "spot");
@@ -430,133 +816,63 @@ int main(int argc, char* argv[]) {
     bot::SignalComposer composer(cfg);
 
     // 4. Shared ring buffer — feed → signal thread
-    WebSocketFeed::CandleQueue candle_queue;
+    MarketDataFeed::CandleQueue candle_queue;
 
-    // 5. Gateway selection (compile-time CRTP dispatch via if constexpr + variant approach)
-    //    We use a type-erased wrapper via a lambda to avoid template propagation into main.
-    //    In a real system, you'd template the whole engine on GatewayT at compile time.
+    bot::ShadowGateway gateway(cfg.shadow, cfg.fee, state);
+    bot::TradeEngine<bot::ShadowGateway> engine(
+        state, gateway, composer, fee_gate, risk_mgr, portfolio, cfg);
 
-    if (cfg.is_shadow_mode) {
-        // ---- SHADOW path ----
-        bot::ShadowGateway gateway(cfg.shadow, state);
-        bot::TradeEngine<bot::ShadowGateway> engine(
-            state, gateway, composer, fee_gate, risk_mgr, portfolio, cfg);
+    printf("[INIT] Shadow balance: $%.2f\n", gateway.virtual_balance());
 
-        printf("[INIT] Shadow balance: $%.2f\n", gateway.virtual_balance());
+    std::signal(SIGINT,  handle_signal);
+    std::signal(SIGTERM, handle_signal);
 
-        // Signal handler
-        std::signal(SIGINT,  handle_signal);
-        std::signal(SIGTERM, handle_signal);
+    MarketDataFeed feed(state, candle_queue, cfg);
+    std::thread feed_thread([&] { feed.run(); });
 
-        // Feed thread
-        WebSocketFeed feed(state, candle_queue, cfg);
-        std::thread feed_thread([&] { feed.run(); });
+    std::thread signal_thread([&] {
+        printf("[SIGNAL] Signal thread started\n");
+        while (!g_shutdown.load(std::memory_order_acquire)) {
+            candle_queue.drain([&](const CandleCloseEvent& ev) {
+                engine.on_closed_candle(ev.sym_idx);
+            });
+            engine.process_signals();
+            engine.monitor_open_trades();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        printf("[SIGNAL] Signal thread exiting\n");
+    });
 
-        // Signal processing thread
-        std::thread signal_thread([&] {
-            printf("[SIGNAL] Signal thread started\n");
-            while (!g_shutdown.load(std::memory_order_acquire)) {
-                candle_queue.drain([&](const CandleCloseEvent& ev) {
-                    engine.on_closed_candle(ev.sym_idx);
-                });
-                engine.process_signals();
-                engine.monitor_open_trades();
-                // Brief yield — in production use a futex/eventfd for notification
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            printf("[SIGNAL] Signal thread exiting\n");
-        });
+    std::thread metrics_thread([&] {
+        int tick = 0;
+        while (!g_shutdown.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            ++tick;
+            const bot::PortfolioSnapshot snap = portfolio.load();
+            printf("\n[HB %03d] equity=$%.2f | open=%d | pnl=$%.2f | DD=%.2f%%\n",
+                   tick,
+                   snap.equity_usd,
+                   snap.open_trade_count,
+                   snap.total_pnl_usd,
+                   snap.drawdown_pct());
+            engine.print_stats();
+            printf("  Fee gate: pass=%.1f%% | shadow balance=$%.2f\n",
+                   fee_gate.pass_rate(),
+                   gateway.virtual_balance());
+            fflush(stdout);
+        }
+    });
 
-        // Metrics/heartbeat thread
-        std::thread metrics_thread([&] {
-            int tick = 0;
-            while (!g_shutdown.load(std::memory_order_acquire)) {
-                std::this_thread::sleep_for(
-                    std::chrono::seconds(cfg.is_shadow_mode ? 10 : 30));
-                ++tick;
-                const bot::PortfolioSnapshot snap = portfolio.load();
-                printf("\n[HB %03d] equity=$%.2f | open=%d | pnl=$%.2f | DD=%.2f%%\n",
-                       tick,
-                       snap.equity_usd,
-                       snap.open_trade_count,
-                       snap.total_pnl_usd,
-                       snap.drawdown_pct());
-                engine.print_stats();
-                printf("  Fee gate: pass=%.1f%% | shadow balance=$%.2f\n",
-                       fee_gate.pass_rate(),
-                       gateway.virtual_balance());
-                fflush(stdout);
-            }
-        });
+    printf("[MAIN] Running in SHADOW mode. Press Ctrl+C to stop.\n\n");
 
-        printf("[MAIN] Running. Press Ctrl+C to stop.\n\n");
+    const int gui_port = cfg.metrics_port > 0 ? cfg.metrics_port : GuiServer::DEFAULT_PORT;
+    GuiServer gui_server(gui_port, state, portfolio, engine, true);
+    std::thread gui_thread([&] { gui_server.run(); });
 
-        // GUI server thread
-        const int gui_port = cfg.metrics_port > 0 ? cfg.metrics_port : GuiServer::DEFAULT_PORT;
-        GuiServer gui_server(gui_port, state, portfolio, engine, true);
-        std::thread gui_thread([&] { gui_server.run(); });
-
-        feed_thread.join();
-        signal_thread.join();
-        metrics_thread.join();
-        gui_thread.join();
-
-    } else {
-        // ---- LIVE path ----
-        printf("[INIT] *** LIVE TRADING MODE — REAL MONEY ***\n");
-        printf("[INIT] API key: %s...\n",
-               cfg.api_key.size() > 8 ? cfg.api_key.substr(0, 8).c_str() : "???");
-
-        bot::LiveGateway gateway(cfg);
-
-        bot::TradeEngine<bot::LiveGateway> engine(
-            state, gateway, composer, fee_gate, risk_mgr, portfolio, cfg);
-
-        std::signal(SIGINT,  handle_signal);
-        std::signal(SIGTERM, handle_signal);
-
-        WebSocketFeed feed(state, candle_queue, cfg);
-        std::thread feed_thread([&] { feed.run(); });
-
-        std::thread exec_thread([&] {
-            printf("[EXEC] Execution thread started\n");
-            while (!g_shutdown.load(std::memory_order_acquire)) {
-                candle_queue.drain([&](const CandleCloseEvent& ev) {
-                    engine.on_closed_candle(ev.sym_idx);
-                });
-                engine.process_signals();
-                engine.monitor_open_trades();
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            printf("[EXEC] Execution thread exiting\n");
-        });
-
-        std::thread metrics_thread([&] {
-            int tick = 0;
-            while (!g_shutdown.load(std::memory_order_acquire)) {
-                std::this_thread::sleep_for(std::chrono::seconds(30));
-                ++tick;
-                const bot::PortfolioSnapshot snap = portfolio.load();
-                printf("\n[HB %03d] equity=$%.2f | open=%d | pnl=$%.2f | DD=%.2f%%\n",
-                       tick, snap.equity_usd, snap.open_trade_count,
-                       snap.total_pnl_usd, snap.drawdown_pct());
-                engine.print_stats();
-                fflush(stdout);
-            }
-        });
-
-        printf("[MAIN] LIVE mode running. Press Ctrl+C to stop.\n\n");
-
-        // GUI server thread
-        const int gui_port = cfg.metrics_port > 0 ? cfg.metrics_port : GuiServer::DEFAULT_PORT;
-        GuiServer gui_server_live(gui_port, state, portfolio, engine, false);
-        std::thread gui_thread_live([&] { gui_server_live.run(); });
-
-        feed_thread.join();
-        exec_thread.join();
-        metrics_thread.join();
-        gui_thread_live.join();
-    }
+    feed_thread.join();
+    signal_thread.join();
+    metrics_thread.join();
+    gui_thread.join();
 
     printf("\n[MAIN] Clean shutdown complete.\n");
     return 0;

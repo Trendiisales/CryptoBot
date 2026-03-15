@@ -24,19 +24,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set(CMAKE_CXX_FLAGS_RELEASE
         "-O3 -march=native -mtune=native -DNDEBUG -flto")
 
-    # Debug: sanitizers for race/UB detection
+    # Debug: sanitizers for memory/UB detection
     set(CMAKE_CXX_FLAGS_DEBUG
-        "-O0 -g -fsanitize=address,undefined,thread -fno-omit-frame-pointer")
+        "-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer")
 
     # Common flags
     add_compile_options(
         -Wall -Wextra -Wpedantic
         -Wno-unused-parameter
         # Favour performance
-        -fno-exceptions           # no exception overhead in hot path
         -ffast-math               # allow reordering FP ops
-        # Cache-line friendly struct padding warnings
-        -Wpadded
     )
 endif()
 
@@ -58,17 +55,12 @@ set(SOURCES
 add_executable(cryptobot ${SOURCES})
 
 # ---------------------------------------------------------------------------
-# OpenSSL (required for HMAC-SHA256 signing in LiveGateway)
+# OpenSSL (required for HTTPS market data access)
 # ---------------------------------------------------------------------------
-find_package(OpenSSL QUIET)
-if(OpenSSL_FOUND)
-    target_link_libraries(cryptobot PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-    target_compile_definitions(cryptobot PRIVATE BOT_USE_OPENSSL)
-    message(STATUS "OpenSSL found — HMAC signing enabled")
-else()
-    message(WARNING "OpenSSL not found — LiveGateway will use stub signing")
-    message(WARNING "Install: sudo apt-get install libssl-dev")
-endif()
+find_package(OpenSSL REQUIRED)
+target_link_libraries(cryptobot PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+target_compile_definitions(cryptobot PRIVATE BOT_USE_OPENSSL)
+message(STATUS "OpenSSL found — HTTPS support enabled")
 
 # ---------------------------------------------------------------------------
 # Threads

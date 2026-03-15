@@ -278,7 +278,7 @@ struct ExecSettings {
 
     static ExecSettings from_config(const Config& c) {
         return {
-            c.get_bool("execution",   "use_post_only",          true),
+            c.get_bool("execution",   "use_post_only",          false),
             c.get_int("execution",    "post_only_timeout_ms",   30000),
             c.get_int("execution",    "max_requeue",            5),
             c.get_double("execution", "twap_min_usd",           5000.0),
@@ -313,6 +313,7 @@ struct Settings {
     ShadowSettings   shadow;
     bool             is_shadow_mode{true};
     bool             is_testnet{false};
+    bool             allow_short_entries{false};
     std::string      api_key;
     std::string      api_secret;
     std::string      rest_base;
@@ -330,6 +331,7 @@ struct Settings {
         s.shadow      = ShadowSettings::from_config(c);
         s.is_shadow_mode = c.is_shadow();
         s.is_testnet     = c.is_testnet();
+        s.allow_short_entries = c.get_bool("bot", "allow_short_entries", false);
         s.api_key        = c.get("exchange", "api_key");
         s.api_secret     = c.get("exchange", "api_secret");
         s.rest_base      = c.rest_base();

@@ -47,6 +47,17 @@ constexpr const char* side_str(Side s) noexcept {
     return s == Side::BUY ? "BUY" : "SELL";
 }
 
+constexpr const char* signal_type_str(SignalType t) noexcept {
+    switch (t) {
+        case SignalType::MOMENTUM:       return "momentum";
+        case SignalType::MEAN_REVERSION: return "mean_reversion";
+        case SignalType::ORDER_FLOW:     return "order_flow";
+        case SignalType::PERP_BASIS:     return "perp_basis";
+        case SignalType::COMPOSITE:      return "composite";
+        default:                         return "none";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BookLevel — single price level in the order book
 // ---------------------------------------------------------------------------

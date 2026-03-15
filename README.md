@@ -20,10 +20,7 @@ g++ -std=c++20 -O3 -march=native -DBOT_USE_OPENSSL \
 ## Run
 
 ```bash
-# Shadow/paper mode (default in config.ini)
-./cryptobot config/config.ini
-
-# Live mode — set shadow_mode = false in config.ini first
+# Shadow/paper mode on live Binance market data
 ./cryptobot config/config.ini
 ```
 
@@ -31,16 +28,17 @@ g++ -std=c++20 -O3 -march=native -DBOT_USE_OPENSSL \
 
 Edit `config/config.ini`:
 - `shadow_mode = true`   → paper trade on live data (no real orders)
-- `shadow_mode = false`  → live trading with real credentials
+- `shadow_mode = false`  → blocked in this build
 - Fill in `api_key` and `api_secret` under `[exchange]`
 - Tune `[fees]`, `[risk]`, `[strategy]` sections
+- `allow_short_entries = false` keeps spot trading long-only; SELL signals flatten longs
 
 ## Architecture
 
 ```
 Feed thread   → SpscRingBuffer<CandleClose> → Signal thread
 Signal thread → SpscRingBuffer<Signal>      → Exec thread
-Exec thread   → FeeGate (8bps) → RiskManager → Gateway (Shadow or Live)
+Exec thread   → FeeGate (8bps) → RiskManager → ShadowGateway
 ```
 
 ### Key design patterns
@@ -81,16 +79,15 @@ config/
 CMakeLists.txt          Build system
 ```
 
-## WebSocket integration (production step)
+## Market Data Feed
 
-The current feed is a stub that simulates candle closes.
-Replace `WebSocketFeed::run()` in `main.cpp` with a real WebSocket client.
-Recommended options:
-- **uWebSockets** (fastest, header-only)
-- **libwebsockets**
-- **Boost.Beast** (if already using Boost)
+The current build uses Binance HTTPS polling for:
+- `bookTicker` every second
+- `depth20` every two seconds
+- closed `kline_1m` detection every five seconds
 
-Subscribe to these Binance streams per symbol:
+For lower latency, replace `MarketDataFeed` in `main.cpp` with a real
+WebSocket client and subscribe to:
 ```
 <symbol>@bookTicker       — best bid/ask (low latency)
 <symbol>@depth20@100ms    — L2 order book

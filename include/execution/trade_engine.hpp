@@ -56,6 +56,23 @@ struct alignas(CACHE_LINE_SIZE) EngineStats {
     std::atomic<std::int64_t>  total_pnl_bps_x1000{0};  // bps * 1000 for precision
 };
 
+struct ClosedTradeRecord {
+    Symbol      symbol{};
+    SignalType  signal_type{SignalType::NONE};
+    double      pnl_bps{0.0};
+    double      entry_price{0.0};
+    double      exit_price{0.0};
+    std::int64_t closed_epoch_ms{0};
+    std::int64_t hold_ms{0};
+    char        reason[16]{};
+};
+
+template<std::size_t CAPACITY>
+struct ClosedTradeLogSnapshot {
+    std::array<ClosedTradeRecord, CAPACITY> entries{};
+    std::size_t count{0};
+};
+
 // ---------------------------------------------------------------------------
 // TradeEngine — single class, templated on gateway type
 // ---------------------------------------------------------------------------
@@ -64,6 +81,8 @@ class TradeEngine {
 public:
     static constexpr std::size_t MAX_TRADES = 32;
     static constexpr std::size_t SIG_QUEUE_SIZE = 512;
+    static constexpr std::size_t CLOSED_TRADE_LOG_CAP = 64;
+    using TradeLogSnapshot = ClosedTradeLogSnapshot<CLOSED_TRADE_LOG_CAP>;
 
     TradeEngine(
         MarketState&   state,
@@ -95,7 +114,16 @@ public:
         if (!ss) return;
 
         const auto sig_opt = composer_.generate(ss->symbol, *ss);
-        if (!sig_opt) return;
+        if (!sig_opt) {
+            ss->last_signal_type.store(
+                static_cast<std::uint8_t>(SignalType::NONE),
+                std::memory_order_release);
+            return;
+        }
+
+        ss->last_signal_type.store(
+            static_cast<std::uint8_t>(sig_opt->type),
+            std::memory_order_release);
 
         stats_.signals_generated.fetch_add(1, std::memory_order_relaxed);
 
@@ -154,6 +182,18 @@ public:
         return gateway_.latency().avg_us();
     }
 
+    [[nodiscard]] double fee_gate_pass_rate_ratio() const noexcept {
+        return fee_gate_.pass_rate() / 100.0;
+    }
+
+    [[nodiscard]] std::uint64_t total_trade_count() const noexcept {
+        return stats_.trades_entered.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] TradeLogSnapshot closed_trade_log() const noexcept {
+        return trade_log_.load();
+    }
+
     void print_stats() const noexcept {
         printf("\n=== Engine Stats ===\n");
         printf("  Signals generated : %llu\n",
@@ -164,9 +204,10 @@ public:
                (unsigned long long)stats_.signals_blocked_risk.load(std::memory_order_relaxed));
         printf("  Trades entered    : %llu\n",
                (unsigned long long)stats_.trades_entered.load(std::memory_order_relaxed));
-        printf("  Trades closed     : %llu (stop) + %llu (tp)\n",
+        printf("  Trades closed     : %llu (stop) + %llu (tp) + %llu (signal)\n",
                (unsigned long long)stats_.trades_closed_stop.load(std::memory_order_relaxed),
-               (unsigned long long)stats_.trades_closed_tp.load(std::memory_order_relaxed));
+               (unsigned long long)stats_.trades_closed_tp.load(std::memory_order_relaxed),
+               (unsigned long long)stats_.trades_closed_signal.load(std::memory_order_relaxed));
         printf("  Open now          : %d\n", open_trade_count());
         printf("  Gateway avg lat   : %.0f µs\n", gateway_.latency().avg_us());
         printf("  Gateway peak lat  : %llu µs\n",
@@ -195,15 +236,13 @@ private:
     alignas(CACHE_LINE_SIZE) std::atomic<int> open_count_{0};
 
     EngineStats stats_;
+    SeqLocked<TradeLogSnapshot> trade_log_{};
     static inline std::atomic<std::uint64_t> trade_id_counter_{1};
 
     // -------------------------------------------------------------------------
 
     void handle_signal(const Signal& sig) noexcept {
         const PortfolioSnapshot port = portfolio_.load();
-
-        // Already have a trade for this symbol?
-        if (find_open_trade(sig.symbol.view()) >= 0) return;
 
         // Get market data
         SymbolState* ss = state_.get(sig.symbol.view());
@@ -212,6 +251,25 @@ private:
         const Ticker     ticker = ss->ticker.load();
         const OrderBook  book   = ss->book.load();
         const double     sym_exp = ss->get_position_usd();
+        const int        open_trade_idx = find_open_trade(sig.symbol.view());
+
+        if (open_trade_idx >= 0) {
+            const Trade& open_trade = trades_[open_trade_idx].trade;
+            if (!cfg_.allow_short_entries
+                && open_trade.side == Side::BUY
+                && sig.side == Side::SELL)
+            {
+                const double exit_price = ticker.bid > 0.0 ? ticker.bid : ticker.last;
+                if (exit_price > 0.0) {
+                    close_trade(static_cast<std::size_t>(open_trade_idx), exit_price, "signal_exit");
+                }
+            }
+            return;
+        }
+
+        if (!cfg_.allow_short_entries && sig.side == Side::SELL) {
+            return;
+        }
 
         // Fee gate
         const FeeGateResult fg = fee_gate_.evaluate(sig, &ticker, &book);
@@ -227,6 +285,11 @@ private:
         const RiskDecision rd = risk_.evaluate(sig, port, sym_exp, last_sig);
         if (!rd.allowed) {
             stats_.signals_blocked_risk.fetch_add(1, std::memory_order_relaxed);
+            if (risk_.is_halted()) {
+                PortfolioSnapshot halted = port;
+                halted.is_halted = true;
+                portfolio_.store(halted);
+            }
             return;
         }
 
@@ -235,7 +298,9 @@ private:
         if (slot_idx < 0) return;   // all slots full
 
         // Build order
-        const double price = (sig.side == Side::BUY) ? ticker.ask : ticker.bid;
+        const double price = cfg_.exec.use_post_only
+            ? ((sig.side == Side::BUY) ? ticker.bid : ticker.ask)
+            : ((sig.side == Side::BUY) ? ticker.ask : ticker.bid);
         const double qty   = rd.position_usd / price;
 
         if (price <= 0.0 || qty <= 0.0) return;
@@ -323,23 +388,23 @@ private:
         const auto pnl_bps_int = static_cast<std::int64_t>(pnl_bps * 1000.0);
         stats_.total_pnl_bps_x1000.fetch_add(pnl_bps_int, std::memory_order_relaxed);
 
-        if (std::strcmp(reason, "stop_hit") == 0)
-            stats_.trades_closed_stop.fetch_add(1, std::memory_order_relaxed);
-        else
-            stats_.trades_closed_tp.fetch_add(1, std::memory_order_relaxed);
-
         // Update portfolio
         const PortfolioSnapshot old_port = portfolio_.load();
         PortfolioSnapshot np = old_port;
         const double notional_entry = t.entry_price * t.qty;
+        const double notional_exit  = t.exit_price * t.qty;
         np.total_exposure_usd = std::max(0.0, np.total_exposure_usd - notional_entry);
+        np.available_usd     += notional_exit - t.exit_fee;
         np.total_pnl_usd     += t.pnl_usd();
         np.daily_pnl_usd     += t.pnl_usd();
         np.equity_usd        += t.pnl_usd();
         if (np.equity_usd > np.peak_equity_usd)
             np.peak_equity_usd = np.equity_usd;
         np.open_trade_count = std::max(0, np.open_trade_count - 1);
+        np.is_halted = risk_.is_halted();
         portfolio_.store(np);
+
+        append_closed_trade(t, reason);
 
         // Clear slot
         SymbolState* ss = state_.get(t.symbol.view());
@@ -363,6 +428,42 @@ private:
             if (trades_[i].trade.symbol.view() == sym) return static_cast<int>(i);
         }
         return -1;
+    }
+
+    void append_closed_trade(const Trade& trade, const char* reason) noexcept {
+        TradeLogSnapshot snap = trade_log_.load();
+        const std::size_t limit = std::min(snap.count, CLOSED_TRADE_LOG_CAP - 1);
+        for (std::size_t i = limit; i > 0; --i) {
+            snap.entries[i] = snap.entries[i - 1];
+        }
+
+        ClosedTradeRecord rec{};
+        rec.symbol          = trade.symbol;
+        rec.signal_type     = trade.signal.type;
+        rec.pnl_bps         = trade.pnl_bps();
+        rec.entry_price     = trade.entry_price;
+        rec.exit_price      = trade.exit_price;
+        rec.closed_epoch_ms = epoch_ms();
+        rec.hold_ms         = static_cast<std::int64_t>((trade.closed_ns - trade.opened_ns) / 1'000'000);
+
+        const char* log_reason =
+            std::strcmp(reason, "stop_hit") == 0    ? "SL"  :
+            std::strcmp(reason, "signal_exit") == 0 ? "SIG" :
+            std::strcmp(reason, "tp_hit") == 0      ? "TP"  :
+                                                       reason;
+        std::strncpy(rec.reason, log_reason, sizeof(rec.reason) - 1);
+
+        snap.entries[0] = rec;
+        snap.count = std::min<std::size_t>(snap.count + 1, CLOSED_TRADE_LOG_CAP);
+        trade_log_.store(snap);
+
+        if (std::strcmp(reason, "stop_hit") == 0) {
+            stats_.trades_closed_stop.fetch_add(1, std::memory_order_relaxed);
+        } else if (std::strcmp(reason, "signal_exit") == 0) {
+            stats_.trades_closed_signal.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            stats_.trades_closed_tp.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 };
 

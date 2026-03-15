@@ -119,6 +119,9 @@ struct alignas(CACHE_LINE_SIZE) SymbolState {
 
     // Last signal timestamp per symbol (for rate limiting)
     std::atomic<std::int64_t> last_signal_ns{0};
+    std::atomic<std::uint8_t> last_signal_type{
+        static_cast<std::uint8_t>(SignalType::NONE)
+    };
 
     // Per-pair position tracking (atomic double via int64 bitcast)
     std::atomic<std::int64_t> position_usd_bits{0};
