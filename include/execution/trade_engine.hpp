@@ -150,6 +150,10 @@ public:
         return open_count_.load(std::memory_order_relaxed);
     }
 
+    [[nodiscard]] double gateway_latency_avg_us() const noexcept {
+        return gateway_.latency().avg_us();
+    }
+
     void print_stats() const noexcept {
         printf("\n=== Engine Stats ===\n");
         printf("  Signals generated : %llu\n",

@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>&#9889; CRYPTOBOT &#8212; Spot Trading Desk</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Barlow+Condensed:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+<style>
+:root{
+  /* Amber accent — visually distinct from Chimera's cyan */
+  --bg:#060a0d;--surface:#0a1018;--surface2:#0d1520;--border:#1a2a38;--border2:#243446;
+  --text:#cce4f0;--muted:#3d5a70;--dim:#0f1e2c;
+  --accent:#f59e0b;--green:#00e676;--red:#ff3d57;--yellow:#ffd600;--orange:#ff6b00;
+  --fm:'IBM Plex Mono',monospace;--fh:'Barlow Condensed',sans-serif;
+  --row-h:calc((100vh - 52px - 32px) / 5);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100vh;overflow:hidden;background:var(--bg);color:var(--text);font-family:var(--fm)}
+
+/* ── TOPBAR ── */
+.topbar{
+  height:52px;display:flex;align-items:center;justify-content:space-between;
+  padding:0 18px;background:var(--surface);border-bottom:2px solid var(--border2);
+  flex-shrink:0;position:relative;z-index:100;
+}
+.logo{font-family:var(--fh);font-size:22px;font-weight:900;letter-spacing:5px;color:var(--accent);text-shadow:0 0 22px rgba(245,158,11,.45)}
+.logo-sub{font-size:11px;color:var(--muted);letter-spacing:3px;font-family:var(--fh);margin-left:10px}
+.tb-center{display:flex;gap:0;align-items:stretch;height:100%}
+.tb-stat{display:flex;flex-direction:column;justify-content:center;align-items:center;padding:0 16px;border-left:1px solid var(--border);min-width:90px}
+.tb-label{font-size:8px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;font-family:var(--fh);margin-bottom:2px}
+.tb-val{font-size:15px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums}
+.tb-val.pos{color:var(--green)}.tb-val.neg{color:var(--red)}.tb-val.accent{color:var(--accent)}
+.tb-right{display:flex;gap:8px;align-items:center}
+.badge{padding:5px 12px;border-radius:2px;font-size:11px;font-weight:700;letter-spacing:2px;border:1px solid;font-family:var(--fh)}
+.badge-shadow{background:rgba(245,158,11,.12);color:var(--accent);border-color:var(--accent)}
+.badge-live{background:rgba(0,230,118,.12);color:var(--green);border-color:var(--green)}
+.badge-disc{background:rgba(255,61,87,.1);color:var(--red);border-color:var(--red)}
+.badge-conn{background:rgba(245,158,11,.1);color:var(--accent);border-color:var(--accent)}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--muted)}
+.dot.live{background:var(--green);box-shadow:0 0 10px var(--green);animation:blink 1.4s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* ── PAGE BODY ── */
+.page-body{display:flex;flex-direction:column;height:calc(100vh - 52px);overflow:hidden;}
+
+/* ── SYMBOL GRID ── */
+.sym-panel{display:flex;flex-direction:column;overflow:hidden;border-bottom:2px solid var(--border2);flex:none;}
+.sym-rows{display:flex;flex-direction:column;flex:none;overflow:hidden;}
+.sym-row{flex:none;display:flex;flex-direction:column;border-bottom:1px solid var(--border);height:80px;overflow:hidden;transition:flex .25s ease;}
+.sym-row:last-child{border-bottom:none}
+.sym-row.expanded{flex:3}
+
+/* Symbol header row */
+.sym-hd{
+  display:grid;
+  grid-template-columns:110px 140px 82px 130px 1fr;
+  align-items:center;padding:0 10px 0 12px;
+  height:28px;flex-shrink:0;background:var(--surface2);
+  border-bottom:1px solid var(--border);cursor:pointer;gap:8px;transition:background .15s;
+}
+.sym-hd:hover{background:rgba(245,158,11,.06)}
+.sym-ticker{font-family:var(--fh);font-size:16px;font-weight:900;color:var(--accent);letter-spacing:1.5px}
+.sym-px{font-size:17px;font-weight:700;color:#fff;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+.sym-px.up{color:var(--green)}.sym-px.down{color:var(--red)}
+.sym-regime{display:inline-block;font-family:var(--fh);font-size:10px;font-weight:700;padding:2px 8px;border-radius:2px;letter-spacing:1px;text-align:center}
+.r-none{background:rgba(74,96,112,.2);color:var(--muted)}
+.r-momentum{background:rgba(245,158,11,.18);color:var(--accent)}
+.r-mean_reversion{background:rgba(0,212,255,.15);color:#00d4ff}
+.r-order_flow{background:rgba(0,230,118,.15);color:var(--green)}
+.r-perp_basis{background:rgba(255,214,0,.15);color:var(--yellow)}
+.r-composite{background:rgba(0,230,118,.18);color:var(--green)}
+.sym-meta{display:flex;gap:14px;font-size:10px;color:var(--muted)}
+.sym-meta span{white-space:nowrap}
+.sym-meta strong{color:#8ab8d0}
+.sym-hd-right{display:flex;align-items:center;gap:10px;justify-content:flex-end}
+.sym-pnl-badge{font-family:var(--fh);font-size:12px;font-weight:700;white-space:nowrap}
+.sym-pnl-badge.pos{color:var(--green)}.sym-pnl-badge.neg{color:var(--red)}.sym-pnl-badge.zero{color:var(--muted)}
+.sym-trades-count{font-size:10px;color:var(--muted);white-space:nowrap}
+.chev{font-size:11px;color:var(--muted);transition:transform .2s;flex-shrink:0}
+.sym-row.expanded .chev{transform:rotate(180deg)}
+
+/* Engine strip — 5 engines matching SignalType */
+.eng-strip{display:grid;grid-template-columns:repeat(5,1fr);flex:1;min-height:0;background:var(--bg);max-height:52px;}
+.eng-cell{display:flex;flex-direction:column;justify-content:center;padding:2px 5px;border-right:1px solid var(--border);position:relative;overflow:hidden;min-width:0;height:52px;box-sizing:border-box;}
+.eng-cell:last-child{border-right:none}
+.eng-cell.has-pos{background:rgba(0,230,118,.04)}
+.eng-cell-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:2px}
+.eng-nm{font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:1px;color:#4a7090;text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.eng-badge{font-family:var(--fh);font-size:8px;font-weight:700;padding:1px 5px;border-radius:1px;letter-spacing:.5px;flex-shrink:0}
+.eb-off{background:rgba(255,255,255,.04);color:var(--muted)}
+.eb-active{background:rgba(0,230,118,.2);color:var(--green)}
+.eb-armed{background:rgba(245,158,11,.2);color:var(--accent);animation:pulse-arm 1s infinite}
+@keyframes pulse-arm{0%,100%{opacity:1}50%{opacity:.4}}
+.eng-stats-row{display:flex;gap:8px;align-items:baseline}
+.eng-pnl{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}
+.eng-pnl.pos{color:var(--green)}.eng-pnl.neg{color:var(--red)}.eng-pnl.zero{color:#4a7090}
+.eng-sub{font-size:9px;color:var(--muted);font-variant-numeric:tabular-nums}
+.eng-cell::before{content:'';position:absolute;left:0;top:0;bottom:0;width:2px;background:transparent;transition:background .3s}
+.eng-cell.has-pos::before{background:var(--green)}
+
+/* Expanded trade rows */
+.sym-trades-exp{display:none;border-top:1px solid var(--border);overflow-y:auto;max-height:140px;background:rgba(0,0,0,.3);}
+.sym-row.expanded .sym-trades-exp{display:block}
+.sym-trades-exp::-webkit-scrollbar{width:3px}
+.sym-trades-exp::-webkit-scrollbar-thumb{background:var(--border2)}
+.trade-row{display:grid;grid-template-columns:40px 58px 64px 70px 1fr 56px 56px 52px;align-items:center;padding:4px 12px;border-bottom:1px solid rgba(255,255,255,.025);font-size:11px;font-variant-numeric:tabular-nums;}
+.trade-row:last-child{border-bottom:none}
+.trade-row.win{border-left:2px solid rgba(0,230,118,.6);background:rgba(0,230,118,.025)}
+.trade-row.loss{border-left:2px solid rgba(255,61,87,.5);background:rgba(255,61,87,.02)}
+.tr-tag{font-family:var(--fh);font-size:10px;font-weight:800;letter-spacing:.5px}
+.tr-tag.win{color:var(--green)}.tr-tag.loss{color:var(--red)}
+.tr-pnl{font-weight:700;font-size:12px}.tr-pnl.pos{color:var(--green)}.tr-pnl.neg{color:var(--red)}
+.tr-usd{font-size:10px;font-weight:600}.tr-usd.pos{color:rgba(0,230,118,.7)}.tr-usd.neg{color:rgba(255,61,87,.7)}
+.tr-eng{font-family:var(--fh);font-size:10px;font-weight:700;color:#4a7090}
+.tr-val{font-size:10px;color:#5a8090;font-weight:500}
+.tr-badge{font-family:var(--fh);font-size:9px;font-weight:700;padding:1px 5px;border-radius:2px}
+.tr-badge.tp{background:rgba(0,230,118,.15);color:var(--green)}
+.tr-badge.sl{background:rgba(255,61,87,.15);color:var(--red)}
+.tr-badge.trail{background:rgba(245,158,11,.12);color:var(--accent)}
+.tr-badge.timeout{background:rgba(255,214,0,.1);color:var(--yellow)}
+.tr-time{font-size:9px;color:#2d4558}
+.trades-empty{padding:6px 12px;font-size:10px;color:var(--muted);font-style:italic}
+
+/* Bottom feed */
+.btm-feed{flex-shrink:0;background:var(--surface);border-top:2px solid var(--border2);}
+.btm-stats-row{height:28px;display:flex;align-items:center;padding:0 12px;gap:14px;border-bottom:1px solid var(--border2);overflow:hidden;}
+.btm-trades-hdr{display:grid;grid-template-columns:58px 44px 90px 62px 72px 72px 58px 58px 52px;padding:2px 12px;background:var(--dim);font-family:var(--fh);font-size:9px;letter-spacing:1.2px;color:var(--muted);border-bottom:1px solid var(--border);}
+.btm-trade-row{display:grid;grid-template-columns:58px 44px 90px 62px 72px 72px 58px 58px 52px;padding:3px 12px;border-bottom:1px solid rgba(26,42,56,.5);font-size:12px;font-variant-numeric:tabular-nums;align-items:center;}
+.btm-trade-row:hover{background:rgba(245,158,11,.03);}
+.btm-trade-row.btr-win{border-left:3px solid var(--green);}
+.btm-trade-row.btr-loss{border-left:3px solid var(--red);}
+.btr-time{color:var(--muted);font-size:11px;}
+.btr-sym{font-family:var(--fh);font-weight:700;font-size:11px;}
+.btr-eng{font-family:var(--fh);font-size:10px;color:var(--accent);letter-spacing:.5px;}
+.btr-why{font-size:10px;font-family:var(--fh);}
+.btr-why.why-tp{color:var(--green);}.btr-why.why-sl{color:var(--red);}.btr-why.why-trail{color:var(--accent);}.btr-why.why-to{color:var(--yellow);}
+.btr-pnl{font-weight:700;}.btr-usd{color:var(--muted);font-size:11px;}.btr-mfe{color:rgba(0,230,118,.8);font-size:11px;}.btr-mae{color:rgba(255,61,87,.7);font-size:11px;}.btr-hold{color:var(--muted);font-size:11px;}
+.tl-label{font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:2px;color:var(--muted);flex-shrink:0}
+.tl-stat{display:flex;align-items:baseline;gap:5px;flex-shrink:0}
+.tl-stat-label{font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-family:var(--fh)}
+.tl-stat-val{font-size:13px;font-weight:700;font-variant-numeric:tabular-nums}
+.tl-stat-val.pos{color:var(--green)}.tl-stat-val.neg{color:var(--red)}.tl-stat-val.accent{color:var(--accent)}
+.tl-sep{width:1px;height:18px;background:var(--border);flex-shrink:0}
+.tl-clear{background:rgba(255,61,87,.1);color:var(--red);border:1px solid rgba(255,61,87,.2);padding:2px 8px;border-radius:2px;font-size:9px;font-family:inherit;cursor:pointer;letter-spacing:1px;margin-left:auto;flex-shrink:0}
+
+/* Trades panel */
+.trades-panel{display:flex;flex-direction:column;flex:1;min-height:0;background:var(--surface);border-top:2px solid var(--border2);}
+.trades-panel-hd{display:flex;align-items:center;gap:16px;padding:5px 12px;background:var(--dim);border-bottom:1px solid var(--border2);flex-shrink:0;}
+.tp-label{font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:2px;color:var(--muted);flex-shrink:0}
+.tp-stats{display:flex;gap:14px;font-size:11px;color:var(--muted)}
+.tp-val{font-weight:700;font-variant-numeric:tabular-nums;color:var(--text);margin-left:2px}
+.tp-val.pos{color:var(--green)}.tp-val.neg{color:var(--red)}
+.eng-tbl{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums;}
+.eng-tbl th{font-family:var(--fh);font-size:9px;letter-spacing:1.5px;color:var(--muted);text-align:right;padding:4px 10px;border-bottom:1px solid var(--border2);font-weight:700;}
+.eng-tbl th:first-child{text-align:left}
+.eng-tbl td{padding:4px 10px;border-bottom:1px solid rgba(26,42,56,.5);text-align:right;white-space:nowrap;}
+.eng-tbl td:first-child{text-align:left;font-family:var(--fh);font-weight:700;letter-spacing:1px;color:var(--accent);font-size:11px;}
+.eng-tbl tr.total-row td{border-top:2px solid var(--border2);color:var(--text);font-weight:800}
+.eng-tbl tr:hover td{background:rgba(245,158,11,.03)}
+.etd-pnl{font-weight:700}.etd-pnl.pos{color:var(--green)}.etd-pnl.neg{color:var(--red)}
+.etd-wr.pos{color:var(--green)}.etd-wr.neg{color:var(--red)}
+.trades-panel-body{overflow-y:auto;flex:1;min-height:0;}
+.rt-row{display:grid;grid-template-columns:52px 52px 80px 1fr 70px 60px;align-items:center;padding:5px 12px;border-bottom:1px solid rgba(26,42,56,.6);font-size:12px;font-variant-numeric:tabular-nums;}
+.rt-row:hover{background:rgba(245,158,11,.03);}
+.rt-row.rt-win{border-left:2px solid var(--green);}
+.rt-row.rt-loss{border-left:2px solid var(--red);}
+.rt-time{color:var(--muted);font-size:11px;}
+.rt-sym{font-family:var(--fh);font-weight:700;font-size:11px;color:var(--text);}
+.rt-eng{font-family:var(--fh);font-size:10px;letter-spacing:.5px;color:var(--accent);}
+.rt-why{font-size:10px;color:var(--muted);text-align:center;}
+.rt-why.why-tp{color:var(--green);}.rt-why.why-sl{color:var(--red);}.rt-why.why-trail{color:var(--accent);}
+.rt-pnl{font-weight:700;text-align:right;}
+.rt-hold{color:var(--muted);font-size:10px;text-align:right;}
+
+/* Fee gate + risk stats panel */
+.risk-panel{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:8px 12px;border-top:1px solid var(--border);flex-shrink:0;}
+.risk-card{background:rgba(245,158,11,.04);border:1px solid var(--border);border-radius:3px;padding:6px 10px;}
+.rc-label{font-family:var(--fh);font-size:8px;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase;margin-bottom:4px}
+.rc-val{font-size:16px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--text)}
+.rc-val.pos{color:var(--green)}.rc-val.neg{color:var(--red)}.rc-val.accent{color:var(--accent)}
+.rc-sub{font-size:10px;color:var(--muted);margin-top:2px}
+
+/* Error banner */
+#poll-error{display:none;position:fixed;bottom:0;left:0;right:0;z-index:300;background:rgba(255,61,87,.95);color:#fff;font-family:var(--fh);font-size:12px;font-weight:600;padding:6px 18px;flex-direction:row;align-items:center;gap:14px;border-top:2px solid var(--red)}
+#poll-error.show{display:flex}
+#poll-error-msg{flex:1;letter-spacing:.5px}
+#poll-error-time{color:rgba(255,255,255,.65);font-size:11px}
+/* Win flash */
+#win-flash{display:none;position:fixed;top:0;left:0;right:0;padding:14px;text-align:center;font-family:var(--fh);font-size:28px;font-weight:800;letter-spacing:8px;background:linear-gradient(90deg,var(--accent),#fcd34d);color:#000;z-index:200}
+#win-flash.show{display:block;animation:slidedown .2s ease}
+@keyframes slidedown{from{transform:translateY(-100%)}to{transform:translateY(0)}}
+.sym-hd.flash-win{animation:row-flash-win .8s ease}
+.sym-hd.flash-loss{animation:row-flash-loss .8s ease}
+@keyframes row-flash-win{0%{background:rgba(0,230,118,.35)}100%{background:linear-gradient(90deg,rgba(245,158,11,.06),transparent)}}
+@keyframes row-flash-loss{0%{background:rgba(255,61,87,.25)}100%{background:linear-gradient(90deg,rgba(245,158,11,.06),transparent)}}
+::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+</style>
+</head>
+<body>
+<div id="poll-error"><span id="poll-error-count">ERR0</span><span id="poll-error-msg">Connecting...</span><span id="poll-error-time">--</span></div>
+<div id="win-flash">&#9889; WIN</div>
+
+<!-- TOPBAR -->
+<div class="topbar">
+  <div style="display:flex;align-items:baseline;gap:4px">
+    <span class="logo">CRYPTOBOT</span>
+    <span class="logo-sub">SPOT ENGINE</span>
+  </div>
+  <div class="tb-center">
+    <div class="tb-stat"><span class="tb-label">Equity</span><span id="tb-equity" class="tb-val">$100,000</span></div>
+    <div class="tb-stat"><span class="tb-label">Day P&L</span><span id="tb-pnl" class="tb-val">+0.00bp</span></div>
+    <div class="tb-stat"><span class="tb-label">Trades</span><span id="tb-trades" class="tb-val accent">0</span></div>
+    <div class="tb-stat"><span class="tb-label">Open</span><span id="tb-positions" class="tb-val">0</span></div>
+    <div class="tb-stat"><span class="tb-label">Fee Pass%</span><span id="tb-feegate" class="tb-val accent">--%</span></div>
+    <div class="tb-stat"><span class="tb-label">Uptime</span><span id="tb-uptime" class="tb-val" style="color:var(--muted)">00:00:00</span></div>
+  </div>
+  <div class="tb-right">
+    <button id="audio-unlock" onclick="unlockAudio()" style="background:rgba(245,158,11,.1);color:var(--accent);border:1px solid var(--accent);padding:3px 8px;border-radius:2px;font-size:9px;font-family:inherit;cursor:pointer;letter-spacing:1px">&#128276; UNMUTE</button>
+    <span id="mode-badge" class="badge badge-shadow">SHADOW</span>
+    <span id="conn-badge" class="badge badge-disc">OFFLINE</span>
+    <div id="live-dot" class="dot"></div>
+  </div>
+</div>
+
+<!-- PAGE BODY -->
+<div class="page-body">
+
+  <div class="sym-panel">
+    <div class="sym-rows">
+
+      <!-- BTC -->
+      <div class="sym-row" id="sb-btc">
+        <div class="sym-hd" onclick="toggleSym('btc',event)">
+          <span class="sym-ticker">BTC/USDT</span>
+          <span id="px-btc" class="sym-px">--</span>
+          <span class="sym-regime r-none" id="reg-btc">--</span>
+          <div class="sym-meta">
+            <span>Spread:<strong id="spread-btc">--bp</strong></span>
+            <span>OFI:<strong id="ofi-btc">--</strong></span>
+            <span>Pos:<strong id="pos-btc">$0</strong></span>
+          </div>
+          <div class="sym-hd-right">
+            <span class="sym-pnl-badge zero" id="mini-pnl-btc">+0.00bp</span>
+            <span class="sym-trades-count" id="mini-t-btc">0T</span>
+            <span class="chev">&#9660;</span>
+          </div>
+        </div>
+        <div class="eng-strip">
+          <div class="eng-cell" id="ec-btc-momentum"><div class="eng-cell-top"><span class="eng-nm">MOM</span><span class="eng-badge eb-off" id="eb-btc-momentum">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-btc-momentum">+0bp</span><span class="eng-sub" id="trades-btc-momentum">0T</span></div></div>
+          <div class="eng-cell" id="ec-btc-mean_reversion"><div class="eng-cell-top"><span class="eng-nm">MR</span><span class="eng-badge eb-off" id="eb-btc-mean_reversion">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-btc-mean_reversion">+0bp</span><span class="eng-sub" id="trades-btc-mean_reversion">0T</span></div></div>
+          <div class="eng-cell" id="ec-btc-order_flow"><div class="eng-cell-top"><span class="eng-nm">OFI</span><span class="eng-badge eb-off" id="eb-btc-order_flow">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-btc-order_flow">+0bp</span><span class="eng-sub" id="trades-btc-order_flow">0T</span></div></div>
+          <div class="eng-cell" id="ec-btc-perp_basis"><div class="eng-cell-top"><span class="eng-nm">PERP</span><span class="eng-badge eb-off" id="eb-btc-perp_basis">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-btc-perp_basis">+0bp</span><span class="eng-sub" id="trades-btc-perp_basis">0T</span></div></div>
+          <div class="eng-cell" id="ec-btc-composite"><div class="eng-cell-top"><span class="eng-nm">COMP</span><span class="eng-badge eb-off" id="eb-btc-composite">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-btc-composite">+0bp</span><span class="eng-sub" id="trades-btc-composite">0T</span></div></div>
+        </div>
+        <div class="sym-trades-exp"><div id="str-btc" class="trades-empty">No trades yet</div></div>
+      </div>
+
+      <!-- ETH -->
+      <div class="sym-row" id="sb-eth">
+        <div class="sym-hd" onclick="toggleSym('eth',event)">
+          <span class="sym-ticker">ETH/USDT</span>
+          <span id="px-eth" class="sym-px">--</span>
+          <span class="sym-regime r-none" id="reg-eth">--</span>
+          <div class="sym-meta">
+            <span>Spread:<strong id="spread-eth">--bp</strong></span>
+            <span>OFI:<strong id="ofi-eth">--</strong></span>
+            <span>Pos:<strong id="pos-eth">$0</strong></span>
+          </div>
+          <div class="sym-hd-right">
+            <span class="sym-pnl-badge zero" id="mini-pnl-eth">+0.00bp</span>
+            <span class="sym-trades-count" id="mini-t-eth">0T</span>
+            <span class="chev">&#9660;</span>
+          </div>
+        </div>
+        <div class="eng-strip">
+          <div class="eng-cell" id="ec-eth-momentum"><div class="eng-cell-top"><span class="eng-nm">MOM</span><span class="eng-badge eb-off" id="eb-eth-momentum">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-eth-momentum">+0bp</span><span class="eng-sub" id="trades-eth-momentum">0T</span></div></div>
+          <div class="eng-cell" id="ec-eth-mean_reversion"><div class="eng-cell-top"><span class="eng-nm">MR</span><span class="eng-badge eb-off" id="eb-eth-mean_reversion">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-eth-mean_reversion">+0bp</span><span class="eng-sub" id="trades-eth-mean_reversion">0T</span></div></div>
+          <div class="eng-cell" id="ec-eth-order_flow"><div class="eng-cell-top"><span class="eng-nm">OFI</span><span class="eng-badge eb-off" id="eb-eth-order_flow">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-eth-order_flow">+0bp</span><span class="eng-sub" id="trades-eth-order_flow">0T</span></div></div>
+          <div class="eng-cell" id="ec-eth-perp_basis"><div class="eng-cell-top"><span class="eng-nm">PERP</span><span class="eng-badge eb-off" id="eb-eth-perp_basis">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-eth-perp_basis">+0bp</span><span class="eng-sub" id="trades-eth-perp_basis">0T</span></div></div>
+          <div class="eng-cell" id="ec-eth-composite"><div class="eng-cell-top"><span class="eng-nm">COMP</span><span class="eng-badge eb-off" id="eb-eth-composite">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-eth-composite">+0bp</span><span class="eng-sub" id="trades-eth-composite">0T</span></div></div>
+        </div>
+        <div class="sym-trades-exp"><div id="str-eth" class="trades-empty">No trades yet</div></div>
+      </div>
+
+      <!-- SOL -->
+      <div class="sym-row" id="sb-sol">
+        <div class="sym-hd" onclick="toggleSym('sol',event)">
+          <span class="sym-ticker">SOL/USDT</span>
+          <span id="px-sol" class="sym-px">--</span>
+          <span class="sym-regime r-none" id="reg-sol">--</span>
+          <div class="sym-meta">
+            <span>Spread:<strong id="spread-sol">--bp</strong></span>
+            <span>OFI:<strong id="ofi-sol">--</strong></span>
+            <span>Pos:<strong id="pos-sol">$0</strong></span>
+          </div>
+          <div class="sym-hd-right">
+            <span class="sym-pnl-badge zero" id="mini-pnl-sol">+0.00bp</span>
+            <span class="sym-trades-count" id="mini-t-sol">0T</span>
+            <span class="chev">&#9660;</span>
+          </div>
+        </div>
+        <div class="eng-strip">
+          <div class="eng-cell" id="ec-sol-momentum"><div class="eng-cell-top"><span class="eng-nm">MOM</span><span class="eng-badge eb-off" id="eb-sol-momentum">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-sol-momentum">+0bp</span><span class="eng-sub" id="trades-sol-momentum">0T</span></div></div>
+          <div class="eng-cell" id="ec-sol-mean_reversion"><div class="eng-cell-top"><span class="eng-nm">MR</span><span class="eng-badge eb-off" id="eb-sol-mean_reversion">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-sol-mean_reversion">+0bp</span><span class="eng-sub" id="trades-sol-mean_reversion">0T</span></div></div>
+          <div class="eng-cell" id="ec-sol-order_flow"><div class="eng-cell-top"><span class="eng-nm">OFI</span><span class="eng-badge eb-off" id="eb-sol-order_flow">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-sol-order_flow">+0bp</span><span class="eng-sub" id="trades-sol-order_flow">0T</span></div></div>
+          <div class="eng-cell" id="ec-sol-perp_basis"><div class="eng-cell-top"><span class="eng-nm">PERP</span><span class="eng-badge eb-off" id="eb-sol-perp_basis">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-sol-perp_basis">+0bp</span><span class="eng-sub" id="trades-sol-perp_basis">0T</span></div></div>
+          <div class="eng-cell" id="ec-sol-composite"><div class="eng-cell-top"><span class="eng-nm">COMP</span><span class="eng-badge eb-off" id="eb-sol-composite">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-sol-composite">+0bp</span><span class="eng-sub" id="trades-sol-composite">0T</span></div></div>
+        </div>
+        <div class="sym-trades-exp"><div id="str-sol" class="trades-empty">No trades yet</div></div>
+      </div>
+
+      <!-- BNB -->
+      <div class="sym-row" id="sb-bnb">
+        <div class="sym-hd" onclick="toggleSym('bnb',event)">
+          <span class="sym-ticker">BNB/USDT</span>
+          <span id="px-bnb" class="sym-px">--</span>
+          <span class="sym-regime r-none" id="reg-bnb">--</span>
+          <div class="sym-meta">
+            <span>Spread:<strong id="spread-bnb">--bp</strong></span>
+            <span>OFI:<strong id="ofi-bnb">--</strong></span>
+            <span>Pos:<strong id="pos-bnb">$0</strong></span>
+          </div>
+          <div class="sym-hd-right">
+            <span class="sym-pnl-badge zero" id="mini-pnl-bnb">+0.00bp</span>
+            <span class="sym-trades-count" id="mini-t-bnb">0T</span>
+            <span class="chev">&#9660;</span>
+          </div>
+        </div>
+        <div class="eng-strip">
+          <div class="eng-cell" id="ec-bnb-momentum"><div class="eng-cell-top"><span class="eng-nm">MOM</span><span class="eng-badge eb-off" id="eb-bnb-momentum">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-bnb-momentum">+0bp</span><span class="eng-sub" id="trades-bnb-momentum">0T</span></div></div>
+          <div class="eng-cell" id="ec-bnb-mean_reversion"><div class="eng-cell-top"><span class="eng-nm">MR</span><span class="eng-badge eb-off" id="eb-bnb-mean_reversion">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-bnb-mean_reversion">+0bp</span><span class="eng-sub" id="trades-bnb-mean_reversion">0T</span></div></div>
+          <div class="eng-cell" id="ec-bnb-order_flow"><div class="eng-cell-top"><span class="eng-nm">OFI</span><span class="eng-badge eb-off" id="eb-bnb-order_flow">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-bnb-order_flow">+0bp</span><span class="eng-sub" id="trades-bnb-order_flow">0T</span></div></div>
+          <div class="eng-cell" id="ec-bnb-perp_basis"><div class="eng-cell-top"><span class="eng-nm">PERP</span><span class="eng-badge eb-off" id="eb-bnb-perp_basis">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-bnb-perp_basis">+0bp</span><span class="eng-sub" id="trades-bnb-perp_basis">0T</span></div></div>
+          <div class="eng-cell" id="ec-bnb-composite"><div class="eng-cell-top"><span class="eng-nm">COMP</span><span class="eng-badge eb-off" id="eb-bnb-composite">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-bnb-composite">+0bp</span><span class="eng-sub" id="trades-bnb-composite">0T</span></div></div>
+        </div>
+        <div class="sym-trades-exp"><div id="str-bnb" class="trades-empty">No trades yet</div></div>
+      </div>
+
+      <!-- XRP -->
+      <div class="sym-row" id="sb-xrp">
+        <div class="sym-hd" onclick="toggleSym('xrp',event)">
+          <span class="sym-ticker">XRP/USDT</span>
+          <span id="px-xrp" class="sym-px">--</span>
+          <span class="sym-regime r-none" id="reg-xrp">--</span>
+          <div class="sym-meta">
+            <span>Spread:<strong id="spread-xrp">--bp</strong></span>
+            <span>OFI:<strong id="ofi-xrp">--</strong></span>
+            <span>Pos:<strong id="pos-xrp">$0</strong></span>
+          </div>
+          <div class="sym-hd-right">
+            <span class="sym-pnl-badge zero" id="mini-pnl-xrp">+0.00bp</span>
+            <span class="sym-trades-count" id="mini-t-xrp">0T</span>
+            <span class="chev">&#9660;</span>
+          </div>
+        </div>
+        <div class="eng-strip">
+          <div class="eng-cell" id="ec-xrp-momentum"><div class="eng-cell-top"><span class="eng-nm">MOM</span><span class="eng-badge eb-off" id="eb-xrp-momentum">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-xrp-momentum">+0bp</span><span class="eng-sub" id="trades-xrp-momentum">0T</span></div></div>
+          <div class="eng-cell" id="ec-xrp-mean_reversion"><div class="eng-cell-top"><span class="eng-nm">MR</span><span class="eng-badge eb-off" id="eb-xrp-mean_reversion">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-xrp-mean_reversion">+0bp</span><span class="eng-sub" id="trades-xrp-mean_reversion">0T</span></div></div>
+          <div class="eng-cell" id="ec-xrp-order_flow"><div class="eng-cell-top"><span class="eng-nm">OFI</span><span class="eng-badge eb-off" id="eb-xrp-order_flow">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-xrp-order_flow">+0bp</span><span class="eng-sub" id="trades-xrp-order_flow">0T</span></div></div>
+          <div class="eng-cell" id="ec-xrp-perp_basis"><div class="eng-cell-top"><span class="eng-nm">PERP</span><span class="eng-badge eb-off" id="eb-xrp-perp_basis">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-xrp-perp_basis">+0bp</span><span class="eng-sub" id="trades-xrp-perp_basis">0T</span></div></div>
+          <div class="eng-cell" id="ec-xrp-composite"><div class="eng-cell-top"><span class="eng-nm">COMP</span><span class="eng-badge eb-off" id="eb-xrp-composite">OFF</span></div><div class="eng-stats-row"><span class="eng-pnl zero" id="pnl-xrp-composite">+0bp</span><span class="eng-sub" id="trades-xrp-composite">0T</span></div></div>
+        </div>
+        <div class="sym-trades-exp"><div id="str-xrp" class="trades-empty">No trades yet</div></div>
+      </div>
+
+    </div><!-- /sym-rows -->
+
+    <!-- Bottom feed -->
+    <div class="btm-feed">
+      <div class="btm-stats-row">
+        <span class="tl-label">SESSION</span>
+        <div class="tl-stat"><span class="tl-stat-label">T</span><span class="tl-stat-val accent" id="ts-count">0</span></div>
+        <div class="tl-sep"></div>
+        <div class="tl-stat"><span class="tl-stat-label">WR</span><span class="tl-stat-val" id="ts-wr">--%</span></div>
+        <div class="tl-stat"><span class="tl-stat-val" style="color:var(--green);font-size:11px" id="ts-wins">0</span><span class="tl-stat-label">/</span><span class="tl-stat-val" style="color:var(--red);font-size:11px" id="ts-losses">0</span></div>
+        <div class="tl-sep"></div>
+        <div class="tl-stat"><span class="tl-stat-label">P&L</span><span class="tl-stat-val" id="ts-pnl">+0.00bp</span></div>
+        <div class="tl-stat"><span class="tl-stat-label">USD</span><span class="tl-stat-val" id="ts-usd">+$0.00</span></div>
+        <div class="tl-sep"></div>
+        <div class="tl-stat"><span class="tl-stat-label">AvgW</span><span class="tl-stat-val pos" id="ts-avgwin">--</span></div>
+        <div class="tl-stat"><span class="tl-stat-label">AvgL</span><span class="tl-stat-val neg" id="ts-avgloss">--</span></div>
+        <div class="tl-stat"><span class="tl-stat-label">Exp</span><span class="tl-stat-val" id="ts-exp">--</span></div>
+        <div class="tl-sep"></div>
+        <div class="tl-stat"><span class="tl-stat-label">TP</span><span class="tl-stat-val pos" id="st-tp">0</span></div>
+        <div class="tl-stat"><span class="tl-stat-label">SL</span><span class="tl-stat-val neg" id="st-sl">0</span></div>
+        <button class="tl-clear" onclick="clearTrades()">CLEAR</button>
+      </div>
+      <div class="btm-trades-hdr">
+        <span>TIME</span><span>SYM</span><span>ENGINE</span><span>EXIT</span><span>P&L</span><span>USD</span><span>MFE</span><span>MAE</span><span>HOLD</span>
+      </div>
+      <div id="btm-trade-rows"></div>
+    </div>
+  </div><!-- /sym-panel -->
+
+  <!-- TRADES PANEL -->
+  <div class="trades-panel">
+    <div class="trades-panel-hd">
+      <span class="tp-label">TRADE LOG</span>
+      <div class="tp-stats">
+        <span>W:<span id="tp-wins" class="tp-val pos">0</span></span>
+        <span>L:<span id="tp-losses" class="tp-val neg">0</span></span>
+        <span>WR:<span id="tp-wr" class="tp-val">--%</span></span>
+        <span>PnL:<span id="tp-pnl" class="tp-val">+0.00bp</span></span>
+        <span>USD:<span id="tp-usd" class="tp-val">+$0.00</span></span>
+        <span>AvgW:<span id="tp-avgwin" class="tp-val pos">--</span></span>
+        <span>AvgL:<span id="tp-avgloss" class="tp-val neg">--</span></span>
+        <span>Exp:<span id="tp-exp" class="tp-val">--</span></span>
+        <span>TP:<span id="tp-tp" class="tp-val">0</span></span>
+        <span>SL:<span id="tp-sl" class="tp-val">0</span></span>
+      </div>
+    </div>
+    <div class="trades-panel-body">
+      <div id="recent-trades-list" style="padding:4px 0">
+        <div style="padding:10px 12px;color:var(--muted);font-size:11px;font-style:italic">Waiting for first trade...</div>
+      </div>
+    </div>
+
+    <!-- Engine summary table -->
+    <div style="padding:8px 12px;border-top:1px solid var(--border)">
+      <div style="font-family:var(--fh);font-size:9px;letter-spacing:1.5px;color:var(--muted);margin-bottom:6px">SESSION BY ENGINE</div>
+      <table class="eng-tbl" id="eng-summary-tbl">
+        <thead><tr>
+          <th style="text-align:left">ENGINE</th>
+          <th>TRADES</th><th>W</th><th>L</th><th>WR%</th>
+          <th>TOTAL PnL</th><th>AVG WIN</th><th>AVG LOSS</th><th>EXP</th>
+        </tr></thead>
+        <tbody id="eng-summary-body">
+          <tr><td colspan="9" style="color:var(--muted);font-size:11px;font-style:italic;text-align:center;padding:8px">No trades yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Fee gate + risk stats -->
+    <div class="risk-panel">
+      <div class="risk-card">
+        <div class="rc-label">Fee Gate Pass</div>
+        <div class="rc-val accent" id="rc-feegate">--%</div>
+        <div class="rc-sub">signals cleared 8bp min</div>
+      </div>
+      <div class="risk-card">
+        <div class="rc-label">Signals Blocked</div>
+        <div class="rc-val" id="rc-blocked">0</div>
+        <div class="rc-sub" id="rc-blocked-sub">fee: 0 | risk: 0</div>
+      </div>
+      <div class="risk-card">
+        <div class="rc-label">Daily P&L</div>
+        <div class="rc-val" id="rc-daily-pnl">+$0.00</div>
+        <div class="rc-sub" id="rc-daily-dd">DD: 0.00%</div>
+      </div>
+      <div class="risk-card">
+        <div class="rc-label">Mode</div>
+        <div class="rc-val accent" id="rc-mode">SHADOW</div>
+        <div class="rc-sub" id="rc-gw-lat">gw: --&#181;s</div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /page-body -->
+<script src="/app.js"></script>
+</body>
+</html>

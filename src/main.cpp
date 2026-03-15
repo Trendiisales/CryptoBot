@@ -44,8 +44,16 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <functional>
 #include <string>
 #include <vector>
+#include <sstream>
+#include <fstream>
+// POSIX HTTP server for GUI
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <netinet/tcp.h>
 
 // ---------------------------------------------------------------------------
 // Global shutdown flag — set by SIGINT/SIGTERM
@@ -197,6 +205,188 @@ private:
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// GuiServer — minimal HTTP server serving the GUI and /api/state JSON
+// Binds to 0.0.0.0:GUI_PORT (default 9091). Single-threaded accept loop.
+// All state is read-only (MarketState + AtomicPortfolio) — no locking needed.
+// ---------------------------------------------------------------------------
+class GuiServer {
+public:
+    static constexpr int DEFAULT_PORT = 9091;
+
+    template<typename EngineT>
+    GuiServer(
+        int                    port,
+        bot::MarketState&      state,
+        bot::AtomicPortfolio&  portfolio,
+        EngineT&               engine,
+        bool                   is_shadow)
+        : port_(port)
+        , state_(state)
+        , portfolio_(portfolio)
+        , is_shadow_(is_shadow)
+    {
+        // Capture stats via lambda-compatible pointer
+        get_stats_ = [&engine]() -> std::string {
+            std::ostringstream ss;
+            const auto& st = engine.stats();
+            ss << '"' << "signals_generated" << '"' << ':' << st.signals_generated.load() << ','
+               << '"' << "signals_blocked_fee" << '"' << ':' << st.signals_blocked_fee.load() << ','
+               << '"' << "signals_blocked_risk" << '"' << ':' << st.signals_blocked_risk.load() << ','
+               << '"' << "trades_entered" << '"' << ':' << st.trades_entered.load() << ','
+               << '"' << "open_trades" << '"' << ':' << engine.open_trade_count() << ','
+               << '"' << "gateway_avg_lat_us" << '"' << ':' << engine.gateway_latency_avg_us();
+            return ss.str();
+        };
+    }
+
+    void run() noexcept {
+        int srv = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (srv < 0) { fprintf(stderr, "[GUI] socket() failed\n"); return; }
+        const int yes = 1;
+        ::setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+        struct sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port        = htons(static_cast<uint16_t>(port_));
+
+        if (::bind(srv, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+            fprintf(stderr, "[GUI] bind() failed on port %d\n", port_);
+            ::close(srv); return;
+        }
+        ::listen(srv, 8);
+        printf("[GUI] Serving on http://0.0.0.0:%d\n", port_);
+
+        while (!g_shutdown.load(std::memory_order_acquire)) {
+            struct sockaddr_in client_addr{};
+            socklen_t clen = sizeof(client_addr);
+            const int fd = ::accept(srv, reinterpret_cast<struct sockaddr*>(&client_addr), &clen);
+            if (fd < 0) continue;
+            handle_client(fd);
+        }
+        ::close(srv);
+    }
+
+private:
+    int                    port_;
+    bot::MarketState&      state_;
+    bot::AtomicPortfolio&  portfolio_;
+    bool                   is_shadow_;
+    std::function<std::string()> get_stats_;
+
+    void handle_client(int fd) noexcept {
+        char req[2048]{};
+        const int n = ::recv(fd, req, sizeof(req) - 1, 0);
+        if (n <= 0) { ::close(fd); return; }
+        req[n] = '\0';
+
+        // Parse request line
+        const bool is_get       = std::strncmp(req, "GET ", 4) == 0;
+        const char* path_start  = req + 4;
+        const char* path_end    = std::strchr(path_start, ' ');
+        std::string path(path_start, path_end ? static_cast<std::size_t>(path_end - path_start) : 0);
+
+        if (!is_get) { send_response(fd, 405, "text/plain", "Method Not Allowed"); ::close(fd); return; }
+
+        if (path == "/api/state") {
+            const std::string body = build_state_json();
+            send_response(fd, 200, "application/json", body);
+        } else if (path == "/" || path == "/index.html") {
+            serve_file(fd, "gui/index.html", "text/html");
+        } else if (path == "/app.js") {
+            serve_file(fd, "gui/app.js", "application/javascript");
+        } else if (path == "/style.css") {
+            serve_file(fd, "gui/style.css", "text/css");
+        } else if (path == "/favicon.svg") {
+            serve_file(fd, "gui/favicon.svg", "image/svg+xml");
+        } else {
+            send_response(fd, 404, "text/plain", "Not Found");
+        }
+        ::close(fd);
+    }
+
+    std::string build_state_json() const noexcept {
+        const bot::PortfolioSnapshot snap = portfolio_.load();
+        const auto start_ns = bot::now_ns();
+
+        std::ostringstream j;
+        j << '{';
+
+        // Top-level portfolio
+        j << '"' << "portfolio" << '"' << ":{";
+        j << '"' << "equity_usd" << '"' << ':' << snap.equity_usd << ',';
+        j << '"' << "available_usd" << '"' << ':' << snap.available_usd << ',';
+        j << '"' << "total_pnl_usd" << '"' << ':' << snap.total_pnl_usd << ',';
+        j << '"' << "daily_pnl_usd" << '"' << ':' << snap.daily_pnl_usd << ',';
+        j << '"' << "total_exposure_usd" << '"' << ':' << snap.total_exposure_usd << ',';
+        j << '"' << "open_trade_count" << '"' << ':' << snap.open_trade_count << ',';
+        j << '"' << "drawdown_pct" << '"' << ':' << snap.drawdown_pct() << ',';
+        j << '"' << "is_halted" << '"' << ':' << (snap.is_halted ? "true" : "false");
+        j << "},";
+
+        // Engine stats
+        j << get_stats_() << ',';
+
+        j << '"' << "is_shadow" << '"' << ':' << (is_shadow_ ? "true" : "false") << ',';
+        j << '"' << "total_trades" << '"' << ':' << snap.open_trade_count << ',';
+
+        // Uptime
+        j << '"' << "uptime_hours" << '"' << ':' << 0.0 << ',';
+
+        // Per-symbol data
+        j << '"' << "symbols" << '"' << ":{";
+        bool first_sym = true;
+        for (std::size_t i = 0; i < state_.n_symbols(); ++i) {
+            const bot::SymbolState* ss = state_.get(static_cast<int>(i));
+            if (!ss) continue;
+            if (!first_sym) j << ',';
+            first_sym = false;
+
+            const bot::Ticker    ticker  = ss->ticker.load();
+            const bot::OrderBook book    = ss->book.load();
+            const double         pos_usd = ss->get_position_usd();
+
+            j << '"' << ss->symbol.view() << '"' << ":{";
+            j << '"' << "price" << '"' << ':' << ticker.last << ',';
+            j << '"' << "bid" << '"' << ':' << ticker.bid << ',';
+            j << '"' << "ask" << '"' << ':' << ticker.ask << ',';
+            j << '"' << "spread_bps" << '"' << ':' << ticker.spread_bps() << ',';
+            j << '"' << "ofi" << '"' << ':' << book.order_flow_imbalance() << ',';
+            j << '"' << "position_usd" << '"' << ':' << pos_usd;
+            j << "}";
+        }
+        j << "},";
+
+        // Empty trade log (backend can populate in future)
+        j << '"' << "trade_log" << '"' << ":[]";
+        j << '}';
+        return j.str();
+    }
+
+    void serve_file(int fd, const char* filepath, const char* mime) noexcept {
+        std::ifstream f(filepath, std::ios::binary);
+        if (!f.is_open()) { send_response(fd, 404, "text/plain", "File not found"); return; }
+        const std::string body((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        send_response(fd, 200, mime, body);
+    }
+
+    void send_response(int fd, int code, const char* mime, const std::string& body) noexcept {
+        const char* status = code == 200 ? "200 OK" : code == 404 ? "404 Not Found" : "405 Method Not Allowed";
+        char header[512];
+        const int hlen = std::snprintf(header, sizeof(header),
+            "HTTP/1.1 %s\r\n"
+            "Content-Type: %s; charset=utf-8\r\n"
+            "Content-Length: %zu\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            status, mime, body.size());
+        ::send(fd, header, hlen, 0);
+        ::send(fd, body.c_str(), body.size(), 0);
+    }
+};
+
 int main(int argc, char* argv[]) {
     const char* config_path = (argc > 1) ? argv[1] : "config/config.ini";
 
@@ -301,9 +491,15 @@ int main(int argc, char* argv[]) {
 
         printf("[MAIN] Running. Press Ctrl+C to stop.\n\n");
 
+        // GUI server thread
+        const int gui_port = cfg.metrics_port > 0 ? cfg.metrics_port : GuiServer::DEFAULT_PORT;
+        GuiServer gui_server(gui_port, state, portfolio, engine, true);
+        std::thread gui_thread([&] { gui_server.run(); });
+
         feed_thread.join();
         signal_thread.join();
         metrics_thread.join();
+        gui_thread.join();
 
     } else {
         // ---- LIVE path ----
@@ -350,9 +546,16 @@ int main(int argc, char* argv[]) {
         });
 
         printf("[MAIN] LIVE mode running. Press Ctrl+C to stop.\n\n");
+
+        // GUI server thread
+        const int gui_port = cfg.metrics_port > 0 ? cfg.metrics_port : GuiServer::DEFAULT_PORT;
+        GuiServer gui_server_live(gui_port, state, portfolio, engine, false);
+        std::thread gui_thread_live([&] { gui_server_live.run(); });
+
         feed_thread.join();
         exec_thread.join();
         metrics_thread.join();
+        gui_thread_live.join();
     }
 
     printf("\n[MAIN] Clean shutdown complete.\n");
