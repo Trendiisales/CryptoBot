@@ -657,11 +657,24 @@ public:
             ss << '"' << "signals_generated" << '"' << ':' << st.signals_generated.load() << ','
                << '"' << "signals_blocked_fee" << '"' << ':' << st.signals_blocked_fee.load() << ','
                << '"' << "signals_blocked_risk" << '"' << ':' << st.signals_blocked_risk.load() << ','
+               << '"' << "signals_promoted_research" << '"' << ':' << st.signals_promoted_research.load() << ','
+               << '"' << "blocked_fee_spread" << '"' << ':' << st.blocked_fee_spread.load() << ','
+               << '"' << "blocked_fee_edge" << '"' << ':' << st.blocked_fee_edge.load() << ','
+               << '"' << "blocked_risk_rate_limit" << '"' << ':' << st.blocked_risk_rate_limit.load() << ','
+               << '"' << "blocked_risk_size" << '"' << ':' << st.blocked_risk_size.load() << ','
+               << '"' << "blocked_risk_exposure" << '"' << ':' << st.blocked_risk_exposure.load() << ','
+               << '"' << "blocked_gateway" << '"' << ':' << st.blocked_gateway.load() << ','
                << '"' << "trades_entered" << '"' << ':' << st.trades_entered.load() << ','
                << '"' << "total_trades" << '"' << ':' << engine.total_trade_count() << ','
                << '"' << "open_trades" << '"' << ':' << engine.open_trade_count() << ','
                << '"' << "fee_gate_pass_rate" << '"' << ':' << engine.fee_gate_pass_rate_ratio() << ','
-               << '"' << "gateway_avg_lat_us" << '"' << ':' << engine.gateway_latency_avg_us();
+               << '"' << "gateway_avg_lat_us" << '"' << ':' << engine.gateway_latency_avg_us() << ','
+               << '"' << "win_rate" << '"' << ':' << engine.win_rate_ratio() << ','
+               << '"' << "profit_factor" << '"' << ':' << engine.profit_factor() << ','
+               << '"' << "avg_trade_pnl_bps" << '"' << ':' << engine.avg_trade_pnl_bps() << ','
+               << '"' << "avg_hold_ms" << '"' << ':' << engine.avg_hold_ms() << ','
+               << '"' << "shadow_research_mode" << '"' << ':'
+               << (engine.shadow_research_mode_active() ? "true" : "false");
             return ss.str();
         };
 
@@ -824,7 +837,7 @@ private:
             j << ',';
             append_engine_json(j, "order_flow", last_signal_type == bot::SignalType::ORDER_FLOW);
             j << ',';
-            append_engine_json(j, "perp_basis", last_signal_type == bot::SignalType::PERP_BASIS);
+            append_engine_json(j, "vwap_reversion", last_signal_type == bot::SignalType::VWAP_REVERSION);
             j << ',';
             append_engine_json(j, "composite", last_signal_type == bot::SignalType::COMPOSITE);
             j << "}";
@@ -942,6 +955,11 @@ int main(int argc, char* argv[]) {
     printf("[INIT] Trade journal : %s%s\n",
            cfg.trade_log_file.c_str(),
            trade_journal.enabled() ? "" : " (unavailable)");
+    printf("[INIT] Research mode : %s after %ds idle\n",
+           cfg.research.enable_shadow_relaxation ? "enabled" : "disabled",
+           cfg.research.idle_seconds_before_relaxation);
+    printf("[INIT] Shadow shorts : %s\n",
+           cfg.shadow.allow_synthetic_shorts ? "enabled" : "disabled");
 
     std::signal(SIGINT,  handle_signal);
     std::signal(SIGTERM, handle_signal);
@@ -951,10 +969,18 @@ int main(int argc, char* argv[]) {
 
     std::thread signal_thread([&] {
         printf("[SIGNAL] Signal thread started\n");
+        std::int64_t next_state_eval_ms = 0;
         while (!g_shutdown.load(std::memory_order_acquire)) {
             candle_queue.drain([&](const CandleCloseEvent& ev) {
                 engine.on_closed_candle(ev.sym_idx);
             });
+            const std::int64_t now_epoch_ms = bot::epoch_ms();
+            if (now_epoch_ms >= next_state_eval_ms) {
+                for (std::size_t i = 0; i < state.n_symbols(); ++i) {
+                    engine.on_market_tick(static_cast<int>(i));
+                }
+                next_state_eval_ms = now_epoch_ms + 1000;
+            }
             engine.process_signals();
             engine.monitor_open_trades();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));

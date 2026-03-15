@@ -30,7 +30,7 @@ enum class OrdStatus : std::uint8_t {
     PENDING = 0, OPEN, PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED, EXPIRED
 };
 enum class SignalType : std::uint8_t {
-    NONE = 0, MOMENTUM, MEAN_REVERSION, ORDER_FLOW, PERP_BASIS, COMPOSITE
+    NONE = 0, MOMENTUM, MEAN_REVERSION, ORDER_FLOW, VWAP_REVERSION, COMPOSITE
 };
 enum class TradeState : std::uint8_t {
     NONE = 0, ENTERING, OPEN, EXITING, CLOSED, STOPPED, HALTED
@@ -52,7 +52,7 @@ constexpr const char* signal_type_str(SignalType t) noexcept {
         case SignalType::MOMENTUM:       return "momentum";
         case SignalType::MEAN_REVERSION: return "mean_reversion";
         case SignalType::ORDER_FLOW:     return "order_flow";
-        case SignalType::PERP_BASIS:     return "perp_basis";
+        case SignalType::VWAP_REVERSION: return "vwap_reversion";
         case SignalType::COMPOSITE:      return "composite";
         default:                         return "none";
     }

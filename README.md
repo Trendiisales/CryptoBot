@@ -33,6 +33,8 @@ Edit `config/config.ini`:
 - Tune `[fees]`, `[risk]`, `[strategy]` sections
 - `trade_log_file = logs/trades.csv` stores every closed trade persistently for evaluation
 - `allow_short_entries = false` keeps spot trading long-only; SELL signals flatten longs
+- `[research]` enables Chimera-style shadow relaxation after idle periods so paper mode can sample strong single-engine trades
+- `[shadow] allow_synthetic_shorts = true` enables paper-only short entries for evaluation without changing live-spot behavior
 
 ## Architecture
 
@@ -87,6 +89,9 @@ The current build uses Binance HTTPS polling for:
 - `depth20` every two seconds
 - closed `kline_1m` detection every five seconds
 
+Signal evaluation now happens both on candle close and on live state refreshes, so
+book/imbalance logic is not forced to wait for the next minute close.
+
 For lower latency, replace `MarketDataFeed` in `main.cpp` with a real
 WebSocket client and subscribe to:
 ```
@@ -111,3 +116,11 @@ immediately. The journal includes:
 - order status and simulated latency for entry and exit
 - gross P&L, fees, net P&L, P&L in bps, exit reason
 - portfolio equity, available cash, cumulative P&L after the trade
+
+## Chimera-Derived Logic
+
+This build now borrows the parts of ChimeraCrypto that fit the current data path:
+- VWAP/imbalance reversion as an active signal engine
+- shadow research mode after idle periods
+- performance metrics such as win rate, profit factor, average trade P&L, and average hold time
+- rejection counters for fee/risk/gateway filtering

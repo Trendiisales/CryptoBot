@@ -1,5 +1,5 @@
 // CryptoBot app.js
-// Adapted from ChimeraCrypto — amber theme, 5 symbols, 5 engines (MOM/MR/OFI/PERP/COMP)
+// Adapted from ChimeraCrypto — amber theme, 5 symbols, 5 engines (MOM/MR/OFI/VWAP/COMP)
 // Polls /api/state at 1Hz. Trade log stored in localStorage.
 
 const STORAGE_KEY = 'cryptobot_trades_v1';
@@ -15,8 +15,8 @@ const SYMBOLS = [
 ];
 
 // 5 engines matching SignalType enum in models.hpp
-const ENGINES = ['momentum', 'mean_reversion', 'order_flow', 'perp_basis', 'composite'];
-const ENGINE_LABELS = { momentum:'MOM', mean_reversion:'MR', order_flow:'OFI', perp_basis:'PERP', composite:'COMP' };
+const ENGINES = ['momentum', 'mean_reversion', 'order_flow', 'vwap_reversion', 'composite'];
+const ENGINE_LABELS = { momentum:'MOM', mean_reversion:'MR', order_flow:'OFI', vwap_reversion:'VWAP', composite:'COMP' };
 
 // Account size from config (shadow initial balance)
 const ACCOUNT_SIZE = 100000;
@@ -190,7 +190,7 @@ function signalTypeClass(type) {
 
 function signalTypeLabel(type) {
   if (!type) return '--';
-  const map = { momentum:'MOM', mean_reversion:'MR', order_flow:'OFI', perp_basis:'PERP', composite:'COMP', none:'--' };
+  const map = { momentum:'MOM', mean_reversion:'MR', order_flow:'OFI', vwap_reversion:'VWAP', composite:'COMP', none:'--' };
   return map[type.toLowerCase()] || type.toUpperCase();
 }
 

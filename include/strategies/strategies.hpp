@@ -182,7 +182,7 @@ struct MomentumStrategy : StrategyMixin<MomentumStrategy> {
             s.type             = SignalType::MOMENTUM;
             s.side             = side;
             s.confidence       = 0.65f;
-            s.expected_edge_bps = static_cast<float>(std::min(ema_spread * 0.3, 60.0));
+            s.expected_edge_bps = static_cast<float>(std::min(ema_spread * 0.75 + 5.0, 90.0));
             s.ts_ns            = now_ns();
             s.sub_signals      = 0x01;  // bit 0
             return s;
@@ -230,7 +230,7 @@ struct MeanReversionStrategy : StrategyMixin<MeanReversionStrategy> {
             s.type              = SignalType::MEAN_REVERSION;
             s.side              = side;
             s.confidence        = 0.60f;
-            s.expected_edge_bps = static_cast<float>(std::min(reversion_bps * 0.4, 80.0));
+            s.expected_edge_bps = static_cast<float>(std::min(reversion_bps * 0.80 + 4.0, 110.0));
             s.ts_ns             = now_ns();
             s.sub_signals       = 0x02;  // bit 1
             return s;
@@ -283,7 +283,7 @@ struct OrderFlowStrategy : StrategyMixin<OrderFlowStrategy> {
         s.type              = SignalType::ORDER_FLOW;
         s.side              = ofi > 0.0 ? Side::BUY : Side::SELL;
         s.confidence        = static_cast<float>(std::min(std::abs(ofi), 0.95));
-        s.expected_edge_bps = static_cast<float>(std::abs(ofi) * 6.0);
+        s.expected_edge_bps = static_cast<float>(std::min(std::abs(ofi) * 20.0 + 4.0, 90.0));
         s.ts_ns             = now_ns();
         s.sub_signals       = 0x04;  // bit 2
         return s;
@@ -291,36 +291,65 @@ struct OrderFlowStrategy : StrategyMixin<OrderFlowStrategy> {
 };
 
 // ---------------------------------------------------------------------------
-// 4. PerpBasisStrategy — funding rate directional bias
+// 4. VwapReversionStrategy — Chimera-style VWAP deviation + book confirmation
 // ---------------------------------------------------------------------------
-struct PerpBasisStrategy : StrategyMixin<PerpBasisStrategy> {
+struct VwapReversionStrategy : StrategyMixin<VwapReversionStrategy> {
     const StrategySettings& cfg;
-    explicit PerpBasisStrategy(const StrategySettings& c) : cfg(c) {}
+    const FeeSettings&      fee;
+    explicit VwapReversionStrategy(const StrategySettings& c, const FeeSettings& f)
+        : cfg(c), fee(f) {}
 
-    const char* name_impl() const noexcept { return "PerpBasis"; }
+    const char* name_impl() const noexcept { return "VwapReversion"; }
 
+    template<std::size_t N = 256>
     [[nodiscard]] std::optional<Signal> evaluate(
-        const Symbol& sym, const FundingRate* fr) const noexcept
+        const Symbol& sym,
+        const IndicatorBuf<N>& buf,
+        const OrderBook& book) const noexcept
     {
-        if (!fr) return std::nullopt;
-        const double rate_bps = fr->rate_bps();
+        if (static_cast<int>(buf.count) < 30) return std::nullopt;
+        if (book.n_bids == 0 || book.n_asks == 0) return std::nullopt;
+        if (book.spread_bps() > std::min(fee.max_spread_bps, 2.5)) return std::nullopt;
 
-        auto make_sig = [&](Side side, double base_bps) -> Signal {
+        const std::size_t n = buf.count;
+        const double last = buf.closes[n - 1];
+        const double session_vwap = indicators::vwap(
+            buf.raw_candles.data(),
+            std::min(n, std::size_t{48}));
+        if (session_vwap <= 0.0) return std::nullopt;
+
+        const double deviation_bps = ((last - session_vwap) / session_vwap) * 10'000.0;
+        const double imbalance = book.order_flow_imbalance(10);
+
+        auto make_sig = [&](Side side, double deviation_abs_bps) -> Signal {
+            const double edge = deviation_abs_bps * 1.00 + std::abs(imbalance) * 16.0;
+            const double confidence =
+                std::clamp((deviation_abs_bps / 40.0) + std::abs(imbalance) * 0.35, 0.58, 0.92);
             Signal s{};
             s.symbol            = sym;
-            s.type              = SignalType::PERP_BASIS;
+            s.type              = SignalType::VWAP_REVERSION;
             s.side              = side;
-            s.confidence        = 0.45f;
-            s.expected_edge_bps = static_cast<float>(std::min(base_bps * 1.5, 25.0));
+            s.confidence        = static_cast<float>(confidence);
+            s.expected_edge_bps = static_cast<float>(std::min(edge, 110.0));
             s.ts_ns             = now_ns();
             s.sub_signals       = 0x08;  // bit 3
             return s;
         };
 
-        if (rate_bps > cfg.funding_long_bias_bps)
-            return make_sig(Side::BUY, rate_bps - cfg.funding_long_bias_bps);
-        if (rate_bps < cfg.funding_short_bias_bps)
-            return make_sig(Side::SELL, std::abs(rate_bps) - std::abs(cfg.funding_short_bias_bps));
+        if (deviation_bps <= -cfg.vwap_entry_bps
+            && deviation_bps >= -80.0
+            && imbalance >= 0.10)
+        {
+            return make_sig(Side::BUY, std::abs(deviation_bps));
+        }
+
+        if (deviation_bps >= cfg.vwap_entry_bps
+            && deviation_bps <= 80.0
+            && imbalance <= -0.10)
+        {
+            return make_sig(Side::SELL, std::abs(deviation_bps));
+        }
+
         return std::nullopt;
     }
 };
@@ -334,21 +363,23 @@ public:
     explicit SignalComposer(const Settings& s)
         : cfg_(s.strategy)
         , fee_(s.fee)
+        , research_(s.research)
         , momentum_(s.strategy)
         , mean_rev_(s.strategy)
         , ofi_(s.strategy, s.fee)
-        , perp_basis_(s.strategy)
+        , vwap_rev_(s.strategy, s.fee)
     {}
 
     // Strategy weights (sum = 1.0)
-    static constexpr float W_MOMENTUM = 0.35f;
-    static constexpr float W_MEANREV  = 0.30f;
+    static constexpr float W_MOMENTUM = 0.30f;
+    static constexpr float W_MEANREV  = 0.25f;
     static constexpr float W_OFI      = 0.20f;
-    static constexpr float W_PERP     = 0.15f;
+    static constexpr float W_VWAP     = 0.25f;
 
     [[nodiscard]] std::optional<Signal> generate(
         const Symbol&     sym,
-        const SymbolState& state) const noexcept
+        const SymbolState& state,
+        bool              research_mode = false) const noexcept
     {
         // Extract candle data onto stack
         IndicatorBuf<256> buf{};
@@ -356,21 +387,19 @@ public:
         if (buf.count < 30) return std::nullopt;   // insufficient history
 
         const OrderBook book = state.book.load();
-        const FundingRate fr  = state.funding.load();
-        const bool has_funding = state.funding.has_data();
 
         // Run strategies
         std::optional<Signal> sigs[4];
         sigs[0] = momentum_.evaluate(sym, buf);
         sigs[1] = mean_rev_.evaluate(sym, buf);
         sigs[2] = ofi_.evaluate(sym, book);
-        sigs[3] = has_funding ? perp_basis_.evaluate(sym, &fr) : std::nullopt;
+        sigs[3] = vwap_rev_.evaluate(sym, buf, book);
 
         // Vote counting
         int buy_votes  = 0, sell_votes = 0;
         float buy_w    = 0.0f, sell_w = 0.0f;
         float buy_edge = 0.0f, sell_edge = 0.0f;
-        const float weights[4] = {W_MOMENTUM, W_MEANREV, W_OFI, W_PERP};
+        const float weights[4] = {W_MOMENTUM, W_MEANREV, W_OFI, W_VWAP};
 
         for (int i = 0; i < 4; ++i) {
             if (!sigs[i]) continue;
@@ -386,44 +415,79 @@ public:
             }
         }
 
-        // Require ≥ 2 aligned strategies
-        if (buy_votes < 2 && sell_votes < 2) return std::nullopt;
+        if (buy_votes >= 2 || sell_votes >= 2) {
+            const bool is_buy   = (buy_votes >= 2 && buy_votes > sell_votes);
+            const int  votes    = is_buy ? buy_votes  : sell_votes;
+            const float w_total = is_buy ? buy_w      : sell_w;
+            const float raw_edge= is_buy ? (w_total > 0.0f ? buy_edge  / w_total : 0.0f)
+                                         : (w_total > 0.0f ? sell_edge / w_total : 0.0f);
 
-        const bool is_buy   = (buy_votes >= 2 && buy_votes > sell_votes);
-        const int  votes    = is_buy ? buy_votes  : sell_votes;
-        const float w_total = is_buy ? buy_w      : sell_w;
-        const float raw_edge= is_buy ? (w_total > 0.0f ? buy_edge  / w_total : 0.0f)
-                                     : (w_total > 0.0f ? sell_edge / w_total : 0.0f);
+            // Alignment bonus: +2 bps per extra confirming strategy beyond first
+            const float edge = raw_edge + static_cast<float>((votes - 1) * 2);
 
-        // Alignment bonus: +2 bps per extra confirming strategy beyond first
-        const float edge = raw_edge + static_cast<float>((votes - 1) * 2);
+            // Build composite signal
+            Signal composite{};
+            composite.symbol            = sym;
+            composite.type              = SignalType::COMPOSITE;
+            composite.side              = is_buy ? Side::BUY : Side::SELL;
+            composite.confidence        = std::min(w_total, 1.0f);
+            composite.expected_edge_bps = std::min(edge, 150.0f);
+            composite.ts_ns             = now_ns();
+            composite.n_aligned         = static_cast<std::uint8_t>(votes);
+            composite.sub_signals       = 0;
+            for (int i = 0; i < 4; ++i)
+                if (sigs[i] && sigs[i]->side == composite.side)
+                    composite.sub_signals |= sigs[i]->sub_signals;
 
-        // Build composite signal
-        Signal composite{};
-        composite.symbol            = sym;
-        composite.type              = SignalType::COMPOSITE;
-        composite.side              = is_buy ? Side::BUY : Side::SELL;
-        composite.confidence        = std::min(w_total, 1.0f);
-        composite.expected_edge_bps = std::min(edge, 150.0f);
-        composite.ts_ns             = now_ns();
-        composite.n_aligned         = static_cast<std::uint8_t>(votes);
-        composite.sub_signals       = 0;
-        for (int i = 0; i < 4; ++i)
-            if (sigs[i] && sigs[i]->side == composite.side)
-                composite.sub_signals |= sigs[i]->sub_signals;
+            return composite;
+        }
 
-        return composite;
+        if (!research_mode || !research_.enable_shadow_relaxation) return std::nullopt;
+
+        const Signal* best = nullptr;
+        float best_score = 0.0f;
+        int best_same_side = 0;
+        int best_opp_side = 0;
+
+        for (int i = 0; i < 4; ++i) {
+            if (!sigs[i]) continue;
+            const float score = sigs[i]->confidence * sigs[i]->expected_edge_bps;
+            if (score <= best_score) continue;
+
+            int same_side = 0;
+            int opp_side = 0;
+            for (const auto& candidate : sigs) {
+                if (!candidate) continue;
+                if (candidate->side == sigs[i]->side) ++same_side;
+                else ++opp_side;
+            }
+
+            best = &*sigs[i];
+            best_score = score;
+            best_same_side = same_side;
+            best_opp_side = opp_side;
+        }
+
+        if (!best) return std::nullopt;
+        if (best_same_side <= best_opp_side) return std::nullopt;
+        if (best->confidence < research_.min_single_signal_confidence) return std::nullopt;
+        if (best->expected_edge_bps < research_.min_single_signal_edge_bps) return std::nullopt;
+
+        Signal promoted = *best;
+        promoted.n_aligned = static_cast<std::uint8_t>(best_same_side);
+        return promoted;
     }
 
 private:
     const StrategySettings& cfg_;
     const FeeSettings&      fee_;
+    const ResearchSettings& research_;
 
     // Value members — no heap, no virtual
     MomentumStrategy     momentum_;
     MeanReversionStrategy mean_rev_;
     OrderFlowStrategy    ofi_;
-    PerpBasisStrategy    perp_basis_;
+    VwapReversionStrategy vwap_rev_;
 };
 
 } // namespace bot

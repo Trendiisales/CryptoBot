@@ -293,6 +293,7 @@ struct ShadowSettings {
     int    simulated_fill_latency_us;
     bool   simulate_partial_fills;
     double partial_fill_probability;
+    bool   allow_synthetic_shorts;
 
     static ShadowSettings from_config(const Config& c) {
         return {
@@ -300,6 +301,23 @@ struct ShadowSettings {
             c.get_int("shadow",    "simulated_fill_latency_us",    3500),
             c.get_bool("shadow",   "simulate_partial_fills",       true),
             c.get_double("shadow", "partial_fill_probability",     0.15),
+            c.get_bool("shadow",   "allow_synthetic_shorts",       true),
+        };
+    }
+};
+
+struct ResearchSettings {
+    bool   enable_shadow_relaxation;
+    int    idle_seconds_before_relaxation;
+    double min_single_signal_confidence;
+    double min_single_signal_edge_bps;
+
+    static ResearchSettings from_config(const Config& c) {
+        return {
+            c.get_bool("research",   "enable_shadow_relaxation",      true),
+            c.get_int("research",    "idle_seconds_before_relaxation", 60),
+            c.get_double("research", "min_single_signal_confidence",  0.62),
+            c.get_double("research", "min_single_signal_edge_bps",   16.0),
         };
     }
 };
@@ -311,6 +329,7 @@ struct Settings {
     StrategySettings strategy;
     ExecSettings     exec;
     ShadowSettings   shadow;
+    ResearchSettings research;
     bool             is_shadow_mode{true};
     bool             is_testnet{false};
     bool             allow_short_entries{false};
@@ -330,6 +349,7 @@ struct Settings {
         s.strategy    = StrategySettings::from_config(c);
         s.exec        = ExecSettings::from_config(c);
         s.shadow      = ShadowSettings::from_config(c);
+        s.research    = ResearchSettings::from_config(c);
         s.is_shadow_mode = c.is_shadow();
         s.is_testnet     = c.is_testnet();
         s.allow_short_entries = c.get_bool("bot", "allow_short_entries", false);

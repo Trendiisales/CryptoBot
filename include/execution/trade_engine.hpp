@@ -30,6 +30,8 @@
 #include <thread>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <cmath>
 
 namespace bot {
 
@@ -48,6 +50,13 @@ struct alignas(CACHE_LINE_SIZE) EngineStats {
     std::atomic<std::uint64_t> signals_generated{0};
     std::atomic<std::uint64_t> signals_blocked_fee{0};
     std::atomic<std::uint64_t> signals_blocked_risk{0};
+    std::atomic<std::uint64_t> signals_promoted_research{0};
+    std::atomic<std::uint64_t> blocked_fee_spread{0};
+    std::atomic<std::uint64_t> blocked_fee_edge{0};
+    std::atomic<std::uint64_t> blocked_risk_rate_limit{0};
+    std::atomic<std::uint64_t> blocked_risk_size{0};
+    std::atomic<std::uint64_t> blocked_risk_exposure{0};
+    std::atomic<std::uint64_t> blocked_gateway{0};
     std::atomic<std::uint64_t> trades_entered{0};
     std::atomic<std::uint64_t> trades_closed_stop{0};
     std::atomic<std::uint64_t> trades_closed_tp{0};
@@ -72,6 +81,16 @@ template<std::size_t CAPACITY>
 struct ClosedTradeLogSnapshot {
     std::array<ClosedTradeRecord, CAPACITY> entries{};
     std::size_t count{0};
+};
+
+struct alignas(CACHE_LINE_SIZE) PerformanceStats {
+    std::atomic<std::uint64_t> closed_trades{0};
+    std::atomic<std::uint64_t> winning_trades{0};
+    std::atomic<std::uint64_t> losing_trades{0};
+    std::atomic<std::int64_t>  gross_profit_usd_x1000{0};
+    std::atomic<std::int64_t>  gross_loss_usd_x1000{0};
+    std::atomic<std::int64_t>  total_hold_ms{0};
+    std::atomic<std::int64_t>  last_close_epoch_ms{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -105,35 +124,20 @@ public:
     {
         // TradeSlot contains atomic — init via placement new default construction
         for (auto& s : trades_) { s.trade = Trade{}; s.active.store(false, std::memory_order_relaxed); }
+        for (auto& ts : last_signal_eval_epoch_ms_) {
+            ts.store(0, std::memory_order_relaxed);
+        }
     }
 
     // -------------------------------------------------------------------------
     // Called by signal thread when a candle closes for a symbol
     // -------------------------------------------------------------------------
     void on_closed_candle(int sym_idx) noexcept {
-        if (BOT_UNLIKELY(risk_.is_halted())) return;
+        evaluate_symbol(sym_idx, true);
+    }
 
-        SymbolState* ss = state_.get(sym_idx);
-        if (!ss) return;
-
-        const auto sig_opt = composer_.generate(ss->symbol, *ss);
-        if (!sig_opt) {
-            ss->last_signal_type.store(
-                static_cast<std::uint8_t>(SignalType::NONE),
-                std::memory_order_release);
-            return;
-        }
-
-        ss->last_signal_type.store(
-            static_cast<std::uint8_t>(sig_opt->type),
-            std::memory_order_release);
-
-        stats_.signals_generated.fetch_add(1, std::memory_order_relaxed);
-
-        // Push to exec queue — non-blocking; if full, drop (exec thread busy)
-        if (!sig_queue_.push(*sig_opt)) {
-            // Queue full — rare; just drop the signal
-        }
+    void on_market_tick(int sym_idx) noexcept {
+        evaluate_symbol(sym_idx, false);
     }
 
     // -------------------------------------------------------------------------
@@ -189,6 +193,52 @@ public:
         return fee_gate_.pass_rate() / 100.0;
     }
 
+    [[nodiscard]] double win_rate_ratio() const noexcept {
+        const double total = static_cast<double>(
+            performance_.closed_trades.load(std::memory_order_relaxed));
+        if (total <= 0.0) return 0.0;
+        return static_cast<double>(
+            performance_.winning_trades.load(std::memory_order_relaxed)) / total;
+    }
+
+    [[nodiscard]] double profit_factor() const noexcept {
+        const double gross_profit = static_cast<double>(
+            performance_.gross_profit_usd_x1000.load(std::memory_order_relaxed)) / 1000.0;
+        const double gross_loss = static_cast<double>(
+            performance_.gross_loss_usd_x1000.load(std::memory_order_relaxed)) / 1000.0;
+        if (gross_loss <= 0.0) return gross_profit > 0.0 ? 999.0 : 0.0;
+        return gross_profit / gross_loss;
+    }
+
+    [[nodiscard]] double avg_trade_pnl_bps() const noexcept {
+        const double total = static_cast<double>(
+            performance_.closed_trades.load(std::memory_order_relaxed));
+        if (total <= 0.0) return 0.0;
+        return static_cast<double>(
+            stats_.total_pnl_bps_x1000.load(std::memory_order_relaxed)) / 1000.0 / total;
+    }
+
+    [[nodiscard]] double avg_hold_ms() const noexcept {
+        const double total = static_cast<double>(
+            performance_.closed_trades.load(std::memory_order_relaxed));
+        if (total <= 0.0) return 0.0;
+        return static_cast<double>(
+            performance_.total_hold_ms.load(std::memory_order_relaxed)) / total;
+    }
+
+    [[nodiscard]] std::int64_t last_close_epoch_ms() const noexcept {
+        return performance_.last_close_epoch_ms.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool shadow_research_mode_active() const noexcept {
+        if (!cfg_.is_shadow_mode || !cfg_.research.enable_shadow_relaxation) return false;
+        const std::int64_t idle_ms =
+            static_cast<std::int64_t>(cfg_.research.idle_seconds_before_relaxation) * 1000;
+        const std::int64_t last_close = last_close_epoch_ms();
+        const std::int64_t anchor = last_close > 0 ? last_close : start_epoch_ms_;
+        return epoch_ms() - anchor >= idle_ms;
+    }
+
     [[nodiscard]] std::uint64_t total_trade_count() const noexcept {
         return stats_.trades_entered.load(std::memory_order_relaxed);
     }
@@ -205,12 +255,20 @@ public:
                (unsigned long long)stats_.signals_blocked_fee.load(std::memory_order_relaxed));
         printf("  Blocked (risk)    : %llu\n",
                (unsigned long long)stats_.signals_blocked_risk.load(std::memory_order_relaxed));
+        printf("  Blocked (gateway) : %llu\n",
+               (unsigned long long)stats_.blocked_gateway.load(std::memory_order_relaxed));
+        printf("  Research promote  : %llu\n",
+               (unsigned long long)stats_.signals_promoted_research.load(std::memory_order_relaxed));
         printf("  Trades entered    : %llu\n",
                (unsigned long long)stats_.trades_entered.load(std::memory_order_relaxed));
         printf("  Trades closed     : %llu (stop) + %llu (tp) + %llu (signal)\n",
                (unsigned long long)stats_.trades_closed_stop.load(std::memory_order_relaxed),
                (unsigned long long)stats_.trades_closed_tp.load(std::memory_order_relaxed),
                (unsigned long long)stats_.trades_closed_signal.load(std::memory_order_relaxed));
+        printf("  Win rate          : %.1f%% | PF=%.2f | Avg=%.2f bp\n",
+               win_rate_ratio() * 100.0,
+               profit_factor(),
+               avg_trade_pnl_bps());
         printf("  Open now          : %d\n", open_trade_count());
         printf("  Gateway avg lat   : %.0f µs\n", gateway_.latency().avg_us());
         printf("  Gateway peak lat  : %llu µs\n",
@@ -223,6 +281,42 @@ public:
     }
 
 private:
+    void evaluate_symbol(int sym_idx, bool force) noexcept {
+        if (BOT_UNLIKELY(risk_.is_halted())) return;
+
+        SymbolState* ss = state_.get(sym_idx);
+        if (!ss) return;
+
+        const std::int64_t now_epoch_ms = epoch_ms();
+        if (!force) {
+            const std::int64_t last_eval = last_signal_eval_epoch_ms_[sym_idx].load(std::memory_order_relaxed);
+            if (now_epoch_ms - last_eval < 1000) return;
+        }
+        last_signal_eval_epoch_ms_[sym_idx].store(now_epoch_ms, std::memory_order_relaxed);
+
+        const bool research_mode = shadow_research_mode_active();
+        const auto sig_opt = composer_.generate(ss->symbol, *ss, research_mode);
+        if (!sig_opt) {
+            ss->last_signal_type.store(
+                static_cast<std::uint8_t>(SignalType::NONE),
+                std::memory_order_release);
+            return;
+        }
+
+        ss->last_signal_type.store(
+            static_cast<std::uint8_t>(sig_opt->type),
+            std::memory_order_release);
+
+        stats_.signals_generated.fetch_add(1, std::memory_order_relaxed);
+        if (research_mode && sig_opt->type != SignalType::COMPOSITE) {
+            stats_.signals_promoted_research.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // Push to exec queue — non-blocking; if full, drop (exec thread busy)
+        if (!sig_queue_.push(*sig_opt)) {
+            // Queue full — rare; just drop the signal
+        }
+    }
     MarketState&     state_;
     GatewayT&        gateway_;
     SignalComposer&  composer_;
@@ -231,15 +325,18 @@ private:
     AtomicPortfolio& portfolio_;
     TradeJournal&    trade_journal_;
     const Settings&  cfg_;
+    const std::int64_t start_epoch_ms_{epoch_ms()};
 
     // Signal SPSC queue — feed threads produce, exec thread consumes
     SpscRingBuffer<Signal, SIG_QUEUE_SIZE> sig_queue_;
+    std::array<std::atomic<std::int64_t>, MarketState::MAX_SYMBOLS> last_signal_eval_epoch_ms_{};
 
     // Open trade slots — fixed array, no heap
     std::array<TradeSlot, MAX_TRADES> trades_;
     alignas(CACHE_LINE_SIZE) std::atomic<int> open_count_{0};
 
     EngineStats stats_;
+    PerformanceStats performance_;
     SeqLocked<TradeLogSnapshot> trade_log_{};
     static inline std::atomic<std::uint64_t> trade_id_counter_{1};
 
@@ -259,11 +356,11 @@ private:
 
         if (open_trade_idx >= 0) {
             const Trade& open_trade = trades_[open_trade_idx].trade;
-            if (!cfg_.allow_short_entries
-                && open_trade.side == Side::BUY
-                && sig.side == Side::SELL)
+            if (open_trade.side != sig.side)
             {
-                const double exit_price = ticker.bid > 0.0 ? ticker.bid : ticker.last;
+                const double exit_price = sig.side == Side::SELL
+                    ? (ticker.bid > 0.0 ? ticker.bid : ticker.last)
+                    : (ticker.ask > 0.0 ? ticker.ask : ticker.last);
                 if (exit_price > 0.0) {
                     close_trade(static_cast<std::size_t>(open_trade_idx), exit_price, "signal_exit");
                 }
@@ -271,7 +368,9 @@ private:
             return;
         }
 
-        if (!cfg_.allow_short_entries && sig.side == Side::SELL) {
+        if (!cfg_.allow_short_entries
+            && !shadow_shorting_enabled()
+            && sig.side == Side::SELL) {
             return;
         }
 
@@ -279,6 +378,11 @@ private:
         const FeeGateResult fg = fee_gate_.evaluate(sig, &ticker, &book);
         if (!fg.is_viable) {
             stats_.signals_blocked_fee.fetch_add(1, std::memory_order_relaxed);
+            if (std::strcmp(fg.rejection_reason, "spread too wide") == 0) {
+                stats_.blocked_fee_spread.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                stats_.blocked_fee_edge.fetch_add(1, std::memory_order_relaxed);
+            }
             return;
         }
 
@@ -289,6 +393,13 @@ private:
         const RiskDecision rd = risk_.evaluate(sig, port, sym_exp, last_sig);
         if (!rd.allowed) {
             stats_.signals_blocked_risk.fetch_add(1, std::memory_order_relaxed);
+            if (std::strcmp(rd.reason, "signal rate limit") == 0) {
+                stats_.blocked_risk_rate_limit.fetch_add(1, std::memory_order_relaxed);
+            } else if (std::strcmp(rd.reason, "size too small") == 0) {
+                stats_.blocked_risk_size.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                stats_.blocked_risk_exposure.fetch_add(1, std::memory_order_relaxed);
+            }
             if (risk_.is_halted()) {
                 PortfolioSnapshot halted = port;
                 halted.is_halted = true;
@@ -322,7 +433,10 @@ private:
 
         // Place order
         const PlaceResult pr = gateway_.place(req);
-        if (!pr.ok || pr.result.filled_qty <= 0.0) return;
+        if (!pr.ok || pr.result.filled_qty <= 0.0) {
+            stats_.blocked_gateway.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
 
         // Record trade
         auto& slot       = trades_[slot_idx];
@@ -359,7 +473,11 @@ private:
         // Update portfolio snapshot
         PortfolioSnapshot np = port;
         np.total_exposure_usd += t.entry_price * t.qty;
-        np.available_usd      -= t.entry_price * t.qty + t.entry_fee;
+        if (t.side == Side::BUY) {
+            np.available_usd -= t.entry_price * t.qty + t.entry_fee;
+        } else {
+            np.available_usd += t.entry_price * t.qty - t.entry_fee;
+        }
         np.open_trade_count    = open_count_.load(std::memory_order_relaxed);
         portfolio_.store(np);
 
@@ -407,7 +525,11 @@ private:
         const double notional_entry = t.entry_price * t.qty;
         const double notional_exit  = t.exit_price * t.qty;
         np.total_exposure_usd = std::max(0.0, np.total_exposure_usd - notional_entry);
-        np.available_usd     += notional_exit - t.exit_fee;
+        if (t.side == Side::BUY) {
+            np.available_usd += notional_exit - t.exit_fee;
+        } else {
+            np.available_usd -= notional_exit + t.exit_fee;
+        }
         np.total_pnl_usd     += t.pnl_usd();
         np.daily_pnl_usd     += t.pnl_usd();
         np.equity_usd        += t.pnl_usd();
@@ -419,6 +541,22 @@ private:
 
         append_closed_trade(t, reason);
         trade_journal_.record_closed_trade(t, np, reason, gateway_.is_shadow());
+        performance_.closed_trades.fetch_add(1, std::memory_order_relaxed);
+        performance_.total_hold_ms.fetch_add(
+            static_cast<std::int64_t>(t.duration_sec() * 1000.0),
+            std::memory_order_relaxed);
+        performance_.last_close_epoch_ms.store(t.closed_epoch_ms, std::memory_order_relaxed);
+        if (t.pnl_usd() >= 0.0) {
+            performance_.winning_trades.fetch_add(1, std::memory_order_relaxed);
+            performance_.gross_profit_usd_x1000.fetch_add(
+                static_cast<std::int64_t>(t.pnl_usd() * 1000.0),
+                std::memory_order_relaxed);
+        } else {
+            performance_.losing_trades.fetch_add(1, std::memory_order_relaxed);
+            performance_.gross_loss_usd_x1000.fetch_add(
+                static_cast<std::int64_t>(std::abs(t.pnl_usd()) * 1000.0),
+                std::memory_order_relaxed);
+        }
 
         // Clear slot
         SymbolState* ss = state_.get(t.symbol.view());
@@ -478,6 +616,10 @@ private:
         } else {
             stats_.trades_closed_tp.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+
+    [[nodiscard]] bool shadow_shorting_enabled() const noexcept {
+        return cfg_.is_shadow_mode && cfg_.shadow.allow_synthetic_shorts;
     }
 };
 
